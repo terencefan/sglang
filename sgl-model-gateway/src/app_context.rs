@@ -452,6 +452,24 @@ impl AppContextBuilder {
             .client
             .as_ref()
             .expect("client must be set before load monitor");
+        // The load monitor must follow the load-aware policy interval.  Using the
+        // worker startup probe interval here leaves a long blind window during
+        // request bursts whenever the two intervals differ.
+        let load_check_interval_secs = [
+            &config.policy,
+            config.mode.get_prefill_policy(&config.policy),
+            config.mode.get_decode_policy(&config.policy),
+        ]
+        .into_iter()
+        .filter_map(|policy| match policy {
+            crate::config::types::PolicyConfig::PowerOfTwo {
+                load_check_interval_secs,
+            } => Some(*load_check_interval_secs),
+            _ => None,
+        })
+        .min()
+        .unwrap_or(config.worker_startup_check_interval_secs);
+
         self.load_monitor = Some(Arc::new(LoadMonitor::new(
             self.worker_registry
                 .as_ref()
@@ -462,7 +480,7 @@ impl AppContextBuilder {
                 .expect("policy_registry must be set")
                 .clone(),
             client.clone(),
-            config.worker_startup_check_interval_secs,
+            load_check_interval_secs,
         )));
         self
     }
