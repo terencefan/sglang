@@ -26,6 +26,19 @@ use crate::{
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT: usize = 32;
 
+fn parse_total_token_load(json: &Value) -> Option<isize> {
+    if let Some(loads) = json.get("loads") {
+        let total = loads.as_array()?.iter().try_fold(0_u64, |total, load| {
+            total.checked_add(load.get("num_total_tokens")?.as_u64()?)
+        })?;
+
+        return isize::try_from(total).ok();
+    }
+
+    let total = json.get("aggregate")?.get("total_tokens")?.as_u64()?;
+    isize::try_from(total).ok()
+}
+
 /// Result of a fan-out request to a single worker
 struct WorkerResponse {
     url: String,
@@ -217,12 +230,7 @@ impl WorkerManager {
 
         match req.send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(json) => json
-                    .get("aggregate")
-                    .and_then(|a| a.get("total_tokens"))
-                    .and_then(|v| v.as_i64())
-                    .map(|n| n as isize)
-                    .unwrap_or(-1),
+                Ok(json) => parse_total_token_load(&json).unwrap_or(-1),
                 _ => -1,
             },
             _ => -1,
@@ -389,6 +397,152 @@ impl Drop for LoadMonitor {
             if let Some(handle) = handle_guard.take() {
                 handle.abort();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use axum::{extract::Query, http::StatusCode, routing::get, Json, Router};
+    use serde_json::{json, Value};
+    use tokio::net::TcpListener;
+
+    use super::{parse_total_token_load, WorkerManager};
+
+    #[test]
+    fn parses_current_loads_schema() {
+        let response = json!({
+            "timestamp": "2026-08-13T00:00:00Z",
+            "version": "0.5.16",
+            "loads": [
+                {"dp_rank": 0, "num_total_tokens": 120},
+                {"dp_rank": 1, "num_total_tokens": 80}
+            ]
+        });
+
+        assert_eq!(parse_total_token_load(&response), Some(200));
+    }
+
+    #[test]
+    fn accepts_empty_loads_as_zero_load() {
+        assert_eq!(parse_total_token_load(&json!({"loads": []})), Some(0));
+    }
+
+    #[test]
+    fn falls_back_to_legacy_aggregate_schema() {
+        let response = json!({"aggregate": {"total_tokens": 200}});
+
+        assert_eq!(parse_total_token_load(&response), Some(200));
+    }
+
+    #[test]
+    fn current_schema_takes_precedence_over_legacy_aggregate() {
+        let response = json!({
+            "loads": [{"num_total_tokens": 200}],
+            "aggregate": {"total_tokens": 999}
+        });
+
+        assert_eq!(parse_total_token_load(&response), Some(200));
+    }
+
+    #[test]
+    fn rejects_malformed_current_schema_without_legacy_fallback() {
+        let response = json!({
+            "loads": [{"num_total_tokens": 120}, {"num_total_tokens": "80"}],
+            "aggregate": {"total_tokens": 200}
+        });
+
+        assert_eq!(parse_total_token_load(&response), None);
+    }
+
+    #[test]
+    fn rejects_negative_or_overflowing_loads() {
+        assert_eq!(
+            parse_total_token_load(&json!({"loads": [{"num_total_tokens": -1}]})),
+            None
+        );
+        assert_eq!(
+            parse_total_token_load(&json!({
+                "loads": [
+                    {"num_total_tokens": i64::MAX},
+                    {"num_total_tokens": 1}
+                ]
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_missing_load_fields() {
+        assert_eq!(parse_total_token_load(&json!({})), None);
+        assert_eq!(
+            parse_total_token_load(&json!({"loads": [{"dp_rank": 0}]})),
+            None
+        );
+        assert_eq!(
+            parse_total_token_load(&json!({"aggregate": {"requests": 1}})),
+            None
+        );
+    }
+
+    async fn current_loads_handler(
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Result<Json<Value>, StatusCode> {
+        if query.get("include").map(String::as_str) != Some("core") {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        Ok(Json(json!({
+            "timestamp": "2026-08-13T00:00:00Z",
+            "version": "0.5.16",
+            "loads": [
+                {"dp_rank": 0, "num_total_tokens": 120},
+                {"dp_rank": 1, "num_total_tokens": 80}
+            ]
+        })))
+    }
+
+    #[tokio::test]
+    async fn requests_v1_loads_core_and_parses_current_schema() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/v1/loads", get(current_loads_handler));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let load =
+            WorkerManager::parse_load_response(&client, &format!("http://{address}"), None).await;
+
+        server.abort();
+        assert_eq!(load, 200);
+    }
+
+    #[tokio::test]
+    async fn treats_unsuccessful_or_invalid_responses_as_failed_loads() {
+        for app in [
+            Router::new().route(
+                "/v1/loads",
+                get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            ),
+            Router::new().route("/v1/loads", get(|| async { "not json" })),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let client = reqwest::Client::new();
+            let load =
+                WorkerManager::parse_load_response(&client, &format!("http://{address}"), None)
+                    .await;
+
+            server.abort();
+            assert_eq!(load, -1);
         }
     }
 }
