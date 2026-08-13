@@ -69,18 +69,25 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         let load2_tokens = loads_guard
             .as_ref()
             .and_then(|m| m.get(worker2.url()).copied());
+        let local_load1 = worker1.load();
+        let local_load2 = worker2.load();
 
         // If either worker is missing token data (e.g. monitor failure),
         // we must degrade BOTH to request counts to ensure fairness.
         let (load1, load2) = match (load1_tokens, load2_tokens) {
             (Some(t1), Some(t2)) => {
-                // Both have token data. Compare Tokens.
-                (t1, t2)
+                // Both have token data. Use the router's live in-flight count as a
+                // deterministic tie-breaker so bursts are distributed before the
+                // next token-load polling cycle.
+                ((t1, local_load1), (t2, local_load2))
             }
             _ => {
                 // If One or both are missing token data.
                 // Fallback to local request counts for BOTH.
-                (worker1.load() as isize, worker2.load() as isize)
+                (
+                    (local_load1 as isize, local_load1),
+                    (local_load2 as isize, local_load2),
+                )
             }
         };
 
@@ -92,7 +99,7 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         };
 
         debug!(
-            "Power-of-two selection: {}={} vs {}={} -> selected {}",
+            "Power-of-two selection: {}={:?} vs {}={:?} -> selected {}",
             worker1.url(),
             load1,
             worker2.url(),
@@ -112,7 +119,11 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
 
     fn update_loads(&self, loads: &HashMap<String, isize>) {
         if let Ok(mut cached) = self.cached_loads.write() {
-            *cached = loads.clone();
+            *cached = loads
+                .iter()
+                .filter(|(_, load)| **load >= 0)
+                .map(|(worker, load)| (worker.clone(), *load))
+                .collect();
         }
     }
 
@@ -206,6 +217,31 @@ mod tests {
 
         // Worker2 should be selected significantly more often
         assert!(w2_selected > 35); // Should win most of the time
+    }
+
+    #[tokio::test]
+    async fn test_failed_negative_load_falls_back_to_live_request_count() {
+        let policy = PowerOfTwoPolicy::new();
+        let worker1 = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+        let worker2 = BasicWorkerBuilder::new("http://w2:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+        worker1.increment_load();
+
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1), Arc::new(worker2)];
+        policy.update_loads(&HashMap::from([
+            ("http://w1:8000".to_string(), -1),
+            ("http://w2:8000".to_string(), 50_000),
+        ]));
+
+        assert_eq!(
+            policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .await,
+            Some(1)
+        );
     }
 
     #[tokio::test]

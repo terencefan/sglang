@@ -2,7 +2,11 @@
 //!
 //! Provides worker lifecycle operations and fan-out request utilities.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use axum::response::{IntoResponse, Response};
 use futures::{
@@ -25,10 +29,28 @@ use crate::{
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT: usize = 32;
+const MAX_LOAD_SNAPSHOT_AGE: Duration = Duration::from_secs(30);
 
 fn parse_total_token_load(json: &Value) -> Option<isize> {
     if let Some(loads) = json.get("loads") {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_secs_f64();
+        let max_age = MAX_LOAD_SNAPSHOT_AGE.as_secs_f64();
         let total = loads.as_array()?.iter().try_fold(0_u64, |total, load| {
+            // Newer SGLang servers return a scheduler snapshot timestamp for every
+            // DP rank. The HTTP endpoint can remain responsive while that snapshot
+            // is frozen, so a successful response alone is not proof of fresh load.
+            // Keep accepting timestamp-less payloads for compatibility with the
+            // first version of the `loads` schema.
+            if let Some(timestamp) = load.get("timestamp") {
+                let timestamp = timestamp.as_f64()?;
+                if !timestamp.is_finite() || (now - timestamp).abs() > max_age {
+                    return None;
+                }
+            }
+
             total.checked_add(load.get("num_total_tokens")?.as_u64()?)
         })?;
 
@@ -365,7 +387,7 @@ impl LoadMonitor {
             let result = WorkerManager::get_all_worker_loads(&worker_registry, &client).await;
 
             let mut loads = HashMap::new();
-            for load_info in result.loads {
+            for load_info in result.loads.into_iter().filter(|load| load.load >= 0) {
                 loads.insert(load_info.worker, load_info.load);
             }
 
@@ -403,7 +425,10 @@ impl Drop for LoadMonitor {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use axum::{extract::Query, http::StatusCode, routing::get, Json, Router};
     use serde_json::{json, Value};
@@ -484,6 +509,36 @@ mod tests {
         assert_eq!(
             parse_total_token_load(&json!({"aggregate": {"requests": 1}})),
             None
+        );
+    }
+
+    #[test]
+    fn rejects_stale_or_invalid_scheduler_snapshots() {
+        assert_eq!(
+            parse_total_token_load(&json!({
+                "loads": [{"timestamp": 0.0, "num_total_tokens": 0}]
+            })),
+            None
+        );
+        assert_eq!(
+            parse_total_token_load(&json!({
+                "loads": [{"timestamp": "not-a-number", "num_total_tokens": 0}]
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn accepts_fresh_scheduler_snapshot() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert_eq!(
+            parse_total_token_load(&json!({
+                "loads": [{"timestamp": now, "num_total_tokens": 123}]
+            })),
+            Some(123)
         );
     }
 
