@@ -302,19 +302,29 @@ fn start_engine_state_monitor(config: &Config, use_external_indexer: bool) -> Ar
         // External indexing still needs worker hash metadata and engine load, but no local KV tree.
         return KvEventIndex::new_metadata_only_with_http_and_oracle(http, BlockSizeOracle::new());
     }
-    // Only a peer selector enables bootstrap; without one the tracker is
-    // pre-settled and `/readyz` never waits on it.
+    // Peer discovery or explicit warm peers enable bootstrap; without either,
+    // the tracker is pre-settled and `/readyz` never waits on it.
     let bootstrap = Arc::new(
         match (&config.model.cache_aware, config.discovery.peer_selector()) {
-            (Some(cache), Some(_)) => BootstrapTracker::new_with_opts(
-                Duration::from_millis(cache.bootstrap_timeout_ms),
-                Duration::from_millis(cache.bootstrap_fetch_timeout_cap_ms),
-                cache.bootstrap_seed_required,
-            ),
+            (Some(cache), peer_selector)
+                if peer_selector.is_some() || !cache.bootstrap_peers.is_empty() =>
+            {
+                BootstrapTracker::new_with_opts(
+                    Duration::from_millis(cache.bootstrap_timeout_ms),
+                    Duration::from_millis(cache.bootstrap_fetch_timeout_cap_ms),
+                    cache.bootstrap_seed_required,
+                )
+            }
             _ => BootstrapTracker::disabled(),
         },
     );
-    KvEventIndex::new_with_bootstrap(http, BlockSizeOracle::new(), bootstrap)
+    let index = KvEventIndex::new_with_bootstrap(http, BlockSizeOracle::new(), bootstrap);
+    if let Some(cache) = config.model.cache_aware.as_ref() {
+        if !cache.bootstrap_peers.is_empty() {
+            index.peers().replace(cache.bootstrap_peers.clone());
+        }
+    }
+    index
 }
 
 fn start_local_inflight_tracker(

@@ -781,9 +781,34 @@ fn prompt_dp_rank(
                 block_size as usize,
                 &loads,
             );
+            let cached_tokens = |rank| {
+                placement
+                    .depths
+                    .iter()
+                    .filter(|&&(r, _)| r == rank)
+                    .map(|&(_, d)| d)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_mul(block_size as usize)
+                    .min(tokens.ids.len())
+            };
+            let baseline_uncached = (tokens.ids.len() - cached_tokens(cached_rank)) as u64;
+            let selected_uncached = (tokens.ids.len() - cached_tokens(selected)) as u64;
+            let target_requests = loads
+                .iter()
+                .find(|l| l.rank == selected)
+                .map_or(0, |l| l.num_reqs);
+            ctx.metrics.record_prefill_rank_work(
+                baseline_uncached,
+                selected_uncached,
+                u64::from(block_size) * 4,
+                selected != cached_rank,
+                target_requests,
+            );
             if selected != cached_rank {
                 tracing::info!(worker = %worker.url, from_rank = cached_rank,
                     to_rank = selected, prompt_tokens = tokens.ids.len(),
+                    baseline_uncached, selected_uncached, target_requests,
                     "prefill work rank spill");
             }
             rank = Some(selected);

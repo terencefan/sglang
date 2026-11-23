@@ -485,6 +485,9 @@ impl RouterInflightLoadKind {
 /// internal state is `Arc`/`Atomic`/`Mutex`-protected.
 #[derive(Debug, Default)]
 pub struct MetricsRegistry {
+    // evaluated, warm spill, cold spill, baseline uncached, selected uncached,
+    // extra uncached, reported requests on cold destinations.
+    prefill_rank_work: [AtomicU64; 7],
     // Edge counters (recorded at the app.rs middleware): intake at entry,
     // responses at exit. `requests_total - responses_total` = received but
     // never answered, which `worker_requests_total` (post-dispatch) can't see.
@@ -888,6 +891,32 @@ impl MetricsRegistry {
             .fetch_add(count, Ordering::Relaxed);
     }
 
+    /// Same-cohort rank decisions and token-work estimates, not measured GPU
+    /// work. Native engine counters remain the actual recomputation authority.
+    pub fn record_prefill_rank_work(
+        &self,
+        baseline_uncached: u64,
+        selected_uncached: u64,
+        margin: u64,
+        moved: bool,
+        target_requests: u64,
+    ) {
+        let extra = selected_uncached.saturating_sub(baseline_uncached);
+        let cold = extra > baseline_uncached.saturating_add(margin);
+        let values = [
+            1,
+            u64::from(moved && !cold),
+            u64::from(moved && cold),
+            baseline_uncached,
+            selected_uncached,
+            extra,
+            if moved && cold { target_requests } else { 0 },
+        ];
+        for (counter, value) in self.prefill_rank_work.iter().zip(values) {
+            counter.fetch_add(value, Ordering::Relaxed);
+        }
+    }
+
     /// Pressure-guard pairs compared and overridden with complete monitor data.
     pub fn record_cache_pressure_guard(&self, compared: u64, overrides: u64) {
         self.cache_pressure_guard_compared_total
@@ -1031,6 +1060,18 @@ impl MetricsRegistry {
     /// `sgl_router_worker_*` gauge families.
     pub fn render_with_workers(&self, workers: &[WorkerSnapshot]) -> String {
         let mut out = String::new();
+        for (index,(name,help)) in [
+            ("decisions_total","Rank-work decisions with prompt tokens and fresh load readings."),
+            ("warm_spills_total","Rank changes within the busy-rank recomputation budget."),
+            ("cold_spills_total","Expensive prefix moves admitted only to idle ranks."),
+            ("baseline_uncached_tokens_total","Estimated uncached prompt tokens at the prefix-selected rank."),
+            ("selected_uncached_tokens_total","Estimated uncached prompt tokens at the selected rank."),
+            ("extra_uncached_tokens_total","Estimated extra prompt tokens introduced by rank migration; not measured engine work."),
+            ("cold_target_requests_total","Engine-reported running/waiting requests at cold migration targets; should stay zero."),
+        ].into_iter().enumerate() {
+            let name=format!("sgl_router_prefill_rank_{name}");
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n{name} {}\n",self.prefill_rank_work[index].load(Ordering::Relaxed)));
+        }
 
         // requests_total — edge intake (every request, counted before dispatch)
         out.push_str(
@@ -1624,6 +1665,27 @@ mod tests {
             output.lines().any(|line| line == expected),
             "missing metric line `{expected}`; got:\n{output}"
         );
+    }
+
+    #[test]
+    fn prefill_rank_metrics_share_a_decision_denominator() {
+        let reg = MetricsRegistry::new();
+        reg.record_prefill_rank_work(100, 100, 1024, false, 8);
+        reg.record_prefill_rank_work(100, 300, 1024, true, 3);
+        reg.record_prefill_rank_work(100, 10000, 1024, true, 0);
+        let out = reg.render();
+        for expected in [
+            "decisions_total 3",
+            "warm_spills_total 1",
+            "cold_spills_total 1",
+            "extra_uncached_tokens_total 10100",
+            "cold_target_requests_total 0",
+        ] {
+            assert!(
+                out.contains(&format!("sgl_router_prefill_rank_{expected}")),
+                "{expected}"
+            );
+        }
     }
 
     #[test]

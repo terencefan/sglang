@@ -81,6 +81,37 @@ pub fn prefill_work_rank(
     if cached_rank >= ranks || block_size == 0 || prompt_tokens == 0 {
         return cached_rank;
     }
+    let cached_tokens = |rank: u32| {
+        prefix_depths
+            .iter()
+            .filter(|&&(r, _)| r == rank)
+            .map(|&(_, depth)| depth)
+            .max()
+            .unwrap_or(0)
+            .saturating_mul(block_size)
+            .min(prompt_tokens)
+    };
+    let baseline_uncached = prompt_tokens - cached_tokens(cached_rank);
+    // Busy-to-busy moves may at most double the request's necessary uncached
+    // work (plus four pages). A full cold copy needs genuinely spare capacity,
+    // not merely a shorter queue. Otherwise a saturated fleet keeps moving
+    // long hot prefixes and amplifies its own prefill backlog.
+    let extra_budget = baseline_uncached.saturating_add(block_size.saturating_mul(4));
+    let eligible = |rank: u32| {
+        if rank == cached_rank {
+            return true;
+        }
+        let extra = cached_tokens(cached_rank).saturating_sub(cached_tokens(rank));
+        if extra <= extra_budget {
+            return true;
+        }
+        loads.iter().find(|l| l.rank == rank).is_some_and(|l| {
+            l.num_reqs == 0
+                && l.pending_prefill_tokens == Some(0)
+                && worker.dp_rank_inflight(rank) == 0
+                && worker.dp_rank_dispatched_since(rank, l.at) == 0
+        })
+    };
     let cost = |rank: u32| -> Option<u64> {
         let load = loads.iter().find(|load| load.rank == rank)?;
         let pending = load.pending_prefill_tokens?;
@@ -107,6 +138,7 @@ pub fn prefill_work_rank(
     let current = costs[cached_rank as usize].1;
     let (best, best_cost) = costs
         .into_iter()
+        .filter(|&(rank, _)| eligible(rank))
         .min_by_key(|&(rank, c)| (c, worker.dp_rank_inflight(rank), rank != cached_rank))
         .unwrap();
     if best_cost.saturating_add((block_size as u64).saturating_mul(4)) < current {
@@ -233,7 +265,8 @@ mod tests {
         // A burst must be counted before its next load-publisher update.
         let _sent: Vec<_> = (0..3).map(|_| w.dp_rank_timestamped_guard(1)).collect();
         assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 0);
-        // New reports already include those requests, so stamps are not charged twice.
+        // Complete the prefill leg before considering a cold target idle again.
+        drop(_sent);
         for load in &mut loads {
             load.at = Instant::now() + Duration::from_secs(1);
         }
@@ -269,6 +302,74 @@ mod tests {
         loads[1].pending_prefill_tokens = None;
         assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 0);
         assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 0, &loads), 0);
+    }
+
+    #[test]
+    fn saturated_ranks_preserve_hot_prefix_but_balance_warm_replicas() {
+        let w = worker(2);
+        let at = Instant::now();
+        let mut loads = [
+            RankLoad {
+                rank: 0,
+                num_tokens: 0,
+                num_reqs: 10,
+                pending_prefill_tokens: Some(1_000_000),
+                at,
+            },
+            RankLoad {
+                rank: 1,
+                num_tokens: 0,
+                num_reqs: 1,
+                pending_prefill_tokens: Some(1),
+                at,
+            },
+        ];
+        // An attractive short queue must not repeatedly recompute a 100k prefix.
+        assert_eq!(
+            prefill_work_rank(&w, 0, &[(0, 390)], 100_000, 256, &loads),
+            0
+        );
+        // A similarly warm replica can still take load while busy.
+        assert_eq!(
+            prefill_work_rank(&w, 0, &[(0, 390), (1, 388)], 100_000, 256, &loads),
+            1
+        );
+        // A truly idle rank can expand capacity: balancing is not disabled.
+        loads[1].num_reqs = 0;
+        loads[1].pending_prefill_tokens = Some(0);
+        assert_eq!(
+            prefill_work_rank(&w, 0, &[(0, 390)], 100_000, 256, &loads),
+            1
+        );
+        // A dispatch not yet published consumes that idle expansion slot.
+        let _sent = w.dp_rank_timestamped_guard(1);
+        assert_eq!(
+            prefill_work_rank(&w, 0, &[(0, 390)], 100_000, 256, &loads),
+            0
+        );
+    }
+
+    #[test]
+    fn cold_requests_balance_without_extra_recomputation() {
+        let w = worker(2);
+        let at = Instant::now();
+        let loads = [
+            RankLoad {
+                rank: 0,
+                num_tokens: 0,
+                num_reqs: 20,
+                pending_prefill_tokens: Some(1_000_000),
+                at,
+            },
+            RankLoad {
+                rank: 1,
+                num_tokens: 0,
+                num_reqs: 2,
+                pending_prefill_tokens: Some(10_000),
+                at,
+            },
+        ];
+        assert_eq!(prefill_work_rank(&w, 0, &[], 100_000, 256, &loads), 1);
     }
 
     #[test]

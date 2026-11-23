@@ -485,3 +485,26 @@ workflows run on every `v*` tag.
 ## License
 
 Apache-2.0.
+
+
+### Cache-preserving rank pressure
+
+`prefill_work` retains load balancing but bounds busy-to-busy recomputation.
+The extra uncached tokens of a move may not exceed the request's baseline
+uncached tokens plus four cache pages. Larger copies are admitted only when
+the destination has no engine-reported running/waiting requests, no pending
+uncached tokens, no local in-flight prefill leg and no dispatch since its last
+load report. Cold requests and similarly warm replicas still balance by work.
+
+Counters under `sgl_router_prefill_rank_*` expose one decision denominator,
+warm/cold moves, baseline/selected/extra estimated uncached tokens, and reported
+requests at cold destinations. These token counters are estimates from the
+routing index, not measured GPU work. Validate against native uncached prompt
+counters and total decode throughput.
+
+Static worker discovery can preserve a warm peer's KV index with
+`--kv-bootstrap-peer-url http://warm-router:18097 --kv-bootstrap-seed-required`.
+This reuses the native cursor-checked snapshot and replay bootstrap; it does
+not import state without stream continuity checks. Explicit peers and
+`--kv-peer-selector` are mutually exclusive. Keep the warm peer serving until
+the replacement is ready.

@@ -423,6 +423,10 @@ pub struct CacheArgs {
     /// replica rather than keeping it out for good. Requires --kv-peer-selector.
     #[arg(long)]
     pub kv_bootstrap_seed_required: bool,
+    /// Warm router base URLs to seed KV state with static worker discovery.
+    /// Uses the same cursor-checked native snapshot/replay bootstrap as K8s peers.
+    #[arg(long, num_args = 1..)]
+    pub kv_bootstrap_peer_url: Vec<String>,
 
     /// Minimum cache-hit tokens for a candidate. Defaults to 1024.
     #[arg(long)]
@@ -621,20 +625,26 @@ impl Cli {
         let kv_bootstrap_timeout_ms = self.cache.kv_bootstrap_timeout_ms;
         let kv_bootstrap_fetch_timeout_cap_ms = self.cache.kv_bootstrap_fetch_timeout_cap_ms;
         let kv_bootstrap_seed_required = self.cache.kv_bootstrap_seed_required;
+        let has_static_peers = !self.cache.kv_bootstrap_peer_url.is_empty();
         let cache_aware = self.cache.into_config(self.routing.policy)?;
         // Peer bootstrap grafts into this router's own radix tree, so it needs
         // cache-aware over a local tree; checked here because it spans groups.
         let has_peer_selector = discovery.peer_selector().is_some();
         ensure!(
+            !(has_peer_selector && has_static_peers),
+            "choose --kv-peer-selector or --kv-bootstrap-peer-url, not both"
+        );
+        ensure!(
             has_peer_selector
+                || has_static_peers
                 || (kv_bootstrap_timeout_ms.is_none()
                     && kv_bootstrap_fetch_timeout_cap_ms.is_none()
                     && !kv_bootstrap_seed_required),
             "--kv-bootstrap-timeout-ms / --kv-bootstrap-fetch-timeout-cap-ms / \
              --kv-bootstrap-seed-required require --kv-peer-selector, which is \
-             what enables peer bootstrap"
+             what enables peer bootstrap (or use --kv-bootstrap-peer-url)"
         );
-        if has_peer_selector {
+        if has_peer_selector || has_static_peers {
             match cache_aware.as_ref().map(|c| c.prefix_provider) {
                 None => bail!("--kv-peer-selector requires --policy cache_aware"),
                 Some(p) if p != CachePrefixProvider::RadixTree => bail!(
@@ -1007,7 +1017,23 @@ impl CacheArgs {
             query_timeout_ms: kv_indexer_query_timeout_ms,
             query_max_inflight: kv_indexer_query_max_inflight,
         });
+        let mut bootstrap_peers = Vec::new();
+        for peer in self.kv_bootstrap_peer_url {
+            let url = url::Url::parse(&peer)?;
+            ensure!(
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+                    && url.path() == "/",
+                "--kv-bootstrap-peer-url requires an HTTP(S) base URL"
+            );
+            bootstrap_peers.push(peer.trim_end_matches('/').to_owned());
+        }
         Ok(Some(CacheAwareConfig {
+            bootstrap_peers,
             prefix_provider: cache_prefix_provider,
             kv_indexer_endpoint,
             bootstrap_timeout_ms: self
@@ -3219,6 +3245,26 @@ mod tests {
             legacy_config.model.decode_policy,
             DecodePolicyKind::LegacyHostAffinity
         );
+    }
+
+    #[test]
+    fn static_peer_bootstrap_validates_policy_and_urls() {
+        let c=cfg_of("--policy cache_aware --kv-bootstrap-peer-url http://warm:18097 --kv-bootstrap-seed-required").unwrap();
+        let cache = c.model.cache_aware.unwrap();
+        assert_eq!(cache.bootstrap_peers, ["http://warm:18097"]);
+        assert!(cache.bootstrap_seed_required);
+        for url in [
+            "ftp://warm",
+            "http://warm/path",
+            "http://user:secret@warm",
+            "invalid",
+        ] {
+            assert!(cfg_of(&format!(
+                "--policy cache_aware --kv-bootstrap-peer-url {url}"
+            ))
+            .is_err());
+        }
+        assert!(cfg_of("--policy power_of_two --kv-bootstrap-peer-url http://warm").is_err());
     }
 
     #[test]
