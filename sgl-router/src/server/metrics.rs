@@ -485,6 +485,7 @@ impl RouterInflightLoadKind {
 /// internal state is `Arc`/`Atomic`/`Mutex`-protected.
 #[derive(Debug, Default)]
 pub struct MetricsRegistry {
+    pub(crate) inference_inflight: Arc<crate::server::inflight::InflightHttp>,
     // evaluated, warm spill, cold spill, baseline uncached, selected uncached,
     // extra uncached, reported requests on cold destinations.
     prefill_rank_work: [AtomicU64; 7],
@@ -1060,6 +1061,11 @@ impl MetricsRegistry {
     /// `sgl_router_worker_*` gauge families.
     pub fn render_with_workers(&self, workers: &[WorkerSnapshot]) -> String {
         let mut out = String::new();
+        out.push_str("# HELP sgl_router_inference_inflight_requests Inference HTTP requests from ingress until response body completion or cancellation; excludes probes, metrics and count_tokens; each PD pair counts once.\n# TYPE sgl_router_inference_inflight_requests gauge\n");
+        out.push_str(&format!(
+            "sgl_router_inference_inflight_requests {}\n",
+            self.inference_inflight.count()
+        ));
         for (index,(name,help)) in [
             ("decisions_total","Rank-work decisions with prompt tokens and fresh load readings."),
             ("warm_spills_total","Rank changes within the busy-rank recomputation budget."),
