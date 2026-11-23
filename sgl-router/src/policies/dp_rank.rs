@@ -63,6 +63,59 @@ pub fn expected_rank_tokens(worker: &Worker, loads: &[RankLoad]) -> Vec<(u32, u6
         .collect()
 }
 
+/// Allow a cached request to spill only when saved queued work exceeds its
+/// recomputation cost plus four cache pages of hysteresis. Cache depths include
+/// host-backed entries: a GPU miss alone must not be charged as full prefill.
+/// Call with fresh reports; incomplete/native-field-missing reports fail closed.
+/// Dispatch stamps bridge load-publisher updates conservatively at this prompt's
+/// full size, so a burst cannot repeatedly choose the same apparently idle rank.
+pub fn prefill_work_rank(
+    worker: &Worker,
+    cached_rank: u32,
+    prefix_depths: &[(u32, usize)],
+    prompt_tokens: usize,
+    block_size: usize,
+    loads: &[RankLoad],
+) -> u32 {
+    let ranks = worker.dp_ranks();
+    if cached_rank >= ranks || block_size == 0 || prompt_tokens == 0 {
+        return cached_rank;
+    }
+    let cost = |rank: u32| -> Option<u64> {
+        let load = loads.iter().find(|load| load.rank == rank)?;
+        let pending = load.pending_prefill_tokens?;
+        let depth = prefix_depths
+            .iter()
+            .filter(|&&(r, _)| r == rank)
+            .map(|&(_, depth)| depth)
+            .max()
+            .unwrap_or(0);
+        let cached = depth.saturating_mul(block_size).min(prompt_tokens);
+        let dispatched = worker.dp_rank_dispatched_since(rank, load.at) as u64;
+        Some(
+            pending
+                .saturating_add(dispatched.saturating_mul(prompt_tokens as u64))
+                .saturating_add((prompt_tokens - cached) as u64),
+        )
+    };
+    let Some(costs) = (0..ranks)
+        .map(|rank| cost(rank).map(|c| (rank, c)))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return cached_rank;
+    };
+    let current = costs[cached_rank as usize].1;
+    let (best, best_cost) = costs
+        .into_iter()
+        .min_by_key(|&(rank, c)| (c, worker.dp_rank_inflight(rank), rank != cached_rank))
+        .unwrap();
+    if best_cost.saturating_add((block_size as u64).saturating_mul(4)) < current {
+        best
+    } else {
+        cached_rank
+    }
+}
+
 /// `None` for a single-rank worker. `prefix_depths` is `(rank, cached blocks)`;
 /// `preferred` breaks a load tie among the deepest ranks (media affinity's
 /// rendezvous rank, so replicas agree) and never outranks load or depth;
@@ -161,6 +214,64 @@ mod tests {
     const TOKENS: DpRankPolicy = DpRankPolicy::LeastTokens;
 
     #[test]
+    fn prefill_work_balances_queue_against_cache_and_unreported_dispatches() {
+        let w = worker(2);
+        let at = Instant::now() - Duration::from_millis(1);
+        let reading = |rank, pending| RankLoad {
+            rank,
+            num_tokens: 0,
+            num_reqs: 0,
+            pending_prefill_tokens: pending,
+            at,
+        };
+        let cache = [(0, 39)]; // 9984 of 10000 tokens reusable on rank 0.
+        let mut loads = [reading(0, Some(8000)), reading(1, Some(0))];
+        // A shorter queue is not worth recomputing the prompt.
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 0);
+        loads[0].pending_prefill_tokens = Some(30000);
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 1);
+        // A burst must be counted before its next load-publisher update.
+        let _sent: Vec<_> = (0..3).map(|_| w.dp_rank_timestamped_guard(1)).collect();
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 0);
+        // New reports already include those requests, so stamps are not charged twice.
+        for load in &mut loads {
+            load.at = Instant::now() + Duration::from_secs(1);
+        }
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 1);
+    }
+
+    #[test]
+    fn prefill_work_fails_closed_and_preserves_cache_on_small_gains() {
+        let w = worker(2);
+        let at = Instant::now();
+        let mut loads = [
+            RankLoad {
+                rank: 0,
+                num_tokens: 0,
+                num_reqs: 0,
+                pending_prefill_tokens: Some(10500),
+                at,
+            },
+            RankLoad {
+                rank: 1,
+                num_tokens: 0,
+                num_reqs: 0,
+                pending_prefill_tokens: Some(0),
+                at,
+            },
+        ];
+        let cache = [(0, usize::MAX), (99, usize::MAX)];
+        // Overflowing depths clamp to the prompt; 500 tokens is below hysteresis.
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 0);
+        loads[0].pending_prefill_tokens = Some(u64::MAX);
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 1);
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads[..1]), 0);
+        loads[1].pending_prefill_tokens = None;
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 0);
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 0, &loads), 0);
+    }
+
+    #[test]
     fn affinity_then_prefix_then_load() {
         let w = worker(4);
         assert_eq!(
@@ -248,6 +359,7 @@ mod tests {
             rank,
             num_tokens,
             num_reqs,
+            pending_prefill_tokens: None,
             at,
         };
         let at = Instant::now();

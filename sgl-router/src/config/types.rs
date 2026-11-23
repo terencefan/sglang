@@ -158,8 +158,8 @@ pub enum DecodePolicyKind {
     LegacyHostAffinity,
 }
 
-/// How `--dp-aware` picks a DP rank that no routing key or cached prefix decides,
-/// which in PD mode is every decode rank.
+/// How `--dp-aware` picks a DP rank. Except for `prefill_work`,
+/// explicit routing keys and cached prefixes take priority over load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum DpRankPolicy {
     /// The rank with the fewest requests this router has in flight on it.
@@ -176,6 +176,12 @@ pub enum DpRankPolicy {
     /// `least_in_flight`.
     #[value(name = "least_tokens")]
     LeastTokens,
+    /// Prefer cached prefixes unless another rank has materially less queued
+    /// uncached prefill work, including the cost of this request's cache miss.
+    /// Requires fresh native load reports for every rank; otherwise retains
+    /// prefix-first selection. Explicit sticky/session keys remain pinned.
+    #[value(name = "prefill_work")]
+    PrefillWork,
 }
 
 /// Role served by a static bucket.

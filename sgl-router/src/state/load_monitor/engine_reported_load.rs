@@ -71,7 +71,7 @@ pub struct EngineReportedWorkerLoad {
     pub captured_at: Instant,
 }
 
-/// One DP rank's fresh engine reading, for `--dp-rank-policy least_tokens`.
+/// One DP rank's fresh engine reading for load-aware rank selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RankLoad {
     pub rank: u32,
@@ -81,6 +81,8 @@ pub struct RankLoad {
     pub num_tokens: u64,
     /// Requests running or waiting on the rank.
     pub num_reqs: u64,
+    /// Uncached tokens waiting for prefill, absent on older publishers.
+    pub pending_prefill_tokens: Option<u64>,
     /// When the router received the reading.
     pub at: Instant,
 }
@@ -604,6 +606,10 @@ impl EngineReportedLoadTable {
                     .as_ref()
                     .map_or(load.num_tokens, |native| native.num_total_tokens),
                 num_reqs: load.num_running_reqs.saturating_add(load.num_waiting_reqs),
+                pending_prefill_tokens: load
+                    .native_cache
+                    .as_ref()
+                    .map(|n| n.num_waiting_uncached_tokens),
                 at: *at,
             };
             observed.insert(reading.rank, (reading, fresh));
@@ -767,9 +773,10 @@ mod tests {
         t.set("http://w:30000", 2, load(3, 2), later);
         let rank_2 = t.fresh_rank_loads("http://w:30000", later).unwrap()[2];
         assert_eq!((rank_2.num_reqs, rank_2.at), (5, later));
+        assert_eq!(rank_2.pending_prefill_tokens, None);
         // A V4 publisher's total (in use plus queued prompts) replaces in use.
         let native = NativeCacheRankLoad {
-            num_waiting_uncached_tokens: 0,
+            num_waiting_uncached_tokens: 1234,
             num_total_tokens: 900,
             max_running_requests: 8,
             total_prefill_uncached_tokens: 0,
@@ -781,6 +788,10 @@ mod tests {
         };
         t.set("http://w:30000", 0, total, later);
         assert_eq!(tokens(later).unwrap()[0], (0, 900));
+        assert_eq!(
+            t.fresh_rank_loads("http://w:30000", later).unwrap()[0].pending_prefill_tokens,
+            Some(1234)
+        );
     }
 
     #[test]

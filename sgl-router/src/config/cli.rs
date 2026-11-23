@@ -269,8 +269,9 @@ pub struct RoutingArgs {
     #[arg(long)]
     pub dp_aware: bool,
 
-    /// How --dp-aware picks a rank that no routing key or cached prefix decides.
-    /// Defaults to least_in_flight; least_tokens needs the engine's
+    /// How --dp-aware picks a rank. prefill_work may override prefix affinity
+    /// when queued uncached work outweighs recomputation on another rank.
+    /// Defaults to least_in_flight; least_tokens and prefill_work need the engine's
     /// --load-publish-endpoint feed. In PD mode this is the prefill rank; the
     /// decode rank follows --decode-dp-rank-policy.
     #[arg(long, value_enum, requires = "dp_aware")]
@@ -3222,6 +3223,11 @@ mod tests {
 
     #[test]
     fn dp_rank_policy_requires_dp_aware_and_accepts_least_tokens() {
+        assert_eq!(
+            cfg_of("--policy cache_aware --dp-aware --dp-rank-policy prefill_work --decode-dp-rank-policy least_in_flight")
+                .unwrap().model.dp_rank_policy,
+            DpRankPolicy::PrefillWork
+        );
         assert_eq!(
             cfg_of("--policy power_of_two --dp-aware")
                 .unwrap()

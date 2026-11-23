@@ -392,6 +392,15 @@ unset fields inherit the CLI flags. See
   `--decode-dispatch-limit N` picks the decode rank shortly before the KV
   arrives; see
   [DP-rank routing](REFERENCE.md#dp-rank-routing).
+  `--dp-rank-policy prefill_work` can spill beyond the deepest-prefix ranks
+  when another rank's queued uncached tokens plus this prompt's cache miss
+  are lower by more than four cache pages. Host-backed prefix ownership counts
+  as cached. Fresh native load reports for every rank and a known cache block
+  size are required; otherwise selection stays prefix-first. Dispatches newer
+  than each report are conservatively charged at the current prompt size.
+  This estimates token work, not wall-clock latency or KV reload bandwidth.
+  Explicit sticky/session keys stay pinned. For PD, use
+  `--decode-dp-rank-policy least_in_flight` to keep decode selection unchanged.
 - **PD version groups**: `--pd-version-group-label <key>` pairs prefill and
   decode only within the same engine version; see
   [PD version groups](REFERENCE.md#pd-version-groups).
