@@ -25,7 +25,7 @@
 //! `kv_events::discovery::fetch_event_config` directly (it returns
 //! `Result<Option<EventConfig>>`); the manager intentionally doesn't.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::{HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
@@ -150,6 +150,30 @@ impl WorkerIntrospector {
             Self::fetch_with_retry::<serde_json::Value>(&self.client, &server_info_url, worker_url),
             Self::fetch_with_retry::<ModelInfoBody>(&self.client, &model_info_url, worker_url),
         );
+        // Decode does not need a KV publisher/bootstrap port. Its model identity
+        // can independently confirm the role, and the cached load surface can
+        // report observed rank IDs without waiting for live scheduler-state RPCs.
+        let decode_load_ranks = if parsed.is_none()
+            && model_info
+                .as_ref()
+                .and_then(|m| m.disaggregation_mode.as_deref())
+                == Some("decode")
+        {
+            Self::fetch_with_retry::<serde_json::Value>(
+                &self.client,
+                &format!("{base}/v1/loads"),
+                worker_url,
+            )
+            .await
+            .as_ref()
+            .and_then(decode_ranks_from_loads)
+        } else {
+            None
+        };
+        if let Some(ranks) = decode_load_ranks {
+            warn!(worker_url = %worker_url, dp_ranks = ranks,
+                "introspect: using fresh native decode loads because /server_info is unavailable");
+        }
         // A worker that answers one endpoint and not the other still gets
         // registered with whatever did answer.
         // Parsed apart, so an engine that reports them oddly loses only OpenAI lowering.
@@ -202,12 +226,15 @@ impl WorkerIntrospector {
         ServerInfo {
             served_model_name,
             event_config,
-            disaggregation_role,
+            disaggregation_role: disaggregation_role
+                .or(decode_load_ranks.map(|_| DisaggregationRole::Decode)),
             enable_http2: parsed.enable_http2,
-            dp_ranks: parsed
-                .dp_size
-                .unwrap_or(1)
-                .saturating_mul(parsed.attn_dp_size.unwrap_or(1)),
+            dp_ranks: decode_load_ranks.unwrap_or_else(|| {
+                parsed
+                    .dp_size
+                    .unwrap_or(1)
+                    .saturating_mul(parsed.attn_dp_size.unwrap_or(1))
+            }),
             openai,
             grpc_port: parsed.grpc_port,
             prefill_before_bootstrap: parsed.optimistic_prefill_attempts.map(|attempts| {
@@ -387,6 +414,38 @@ pub(crate) fn resolve_event_config(
 struct ModelInfoBody {
     #[serde(default)]
     served_model_name: Option<String>,
+    #[serde(default)]
+    disaggregation_mode: Option<String>,
+}
+
+/// Accept only fresh, contiguous, unique decode-rank observations. Missing
+/// trailing ranks can conservatively undercount capacity, but never select an
+/// unobserved rank. This does not recover OpenAI lowering/gRPC/event metadata.
+fn decode_ranks_from_loads(body: &serde_json::Value) -> Option<u32> {
+    let loads = body.get("loads")?.as_array()?;
+    if loads.is_empty() || loads.len() > 4096 {
+        return None;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs_f64();
+    let mut seen = vec![false; loads.len()];
+    for load in loads {
+        if load.pointer("/disaggregation/mode")?.as_str()? != "decode" {
+            return None;
+        }
+        let timestamp = load.get("timestamp")?.as_f64()?;
+        if !(now - 5.0..=now + 1.0).contains(&timestamp) {
+            return None;
+        }
+        let rank = usize::try_from(load.get("dp_rank")?.as_u64()?).ok()?;
+        if rank >= seen.len() || seen[rank] {
+            return None;
+        }
+        seen[rank] = true;
+    }
+    Some(loads.len() as u32)
 }
 
 /// Projection of `/server_info` used by the introspector. Every field is
@@ -524,6 +583,71 @@ mod tests {
 
     fn fast_introspector() -> WorkerIntrospector {
         WorkerIntrospector::new(Duration::from_millis(500))
+    }
+
+    fn decode_loads() -> Value {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        json!({"loads": (0..8).map(|rank| json!({"dp_rank":rank,
+            "timestamp":now, "disaggregation":{"mode":"decode"}})).collect::<Vec<_>>()})
+    }
+
+    #[test]
+    fn decode_load_fallback_rejects_stale_missing_mixed_and_duplicate_ranks() {
+        assert_eq!(decode_ranks_from_loads(&decode_loads()), Some(8));
+        let mut body = decode_loads();
+        body["loads"][0]["timestamp"] = json!(0);
+        assert_eq!(decode_ranks_from_loads(&body), None);
+        body = decode_loads();
+        body["loads"][0]["timestamp"] = json!(1e20);
+        assert_eq!(decode_ranks_from_loads(&body), None);
+        body = decode_loads();
+        body["loads"][0]["disaggregation"]["mode"] = json!("prefill");
+        assert_eq!(decode_ranks_from_loads(&body), None);
+        body = decode_loads();
+        body["loads"][0]["dp_rank"] = json!(1);
+        assert_eq!(decode_ranks_from_loads(&body), None);
+        body = decode_loads();
+        body["loads"].as_array_mut().unwrap().remove(3);
+        assert_eq!(decode_ranks_from_loads(&body), None);
+        assert_eq!(decode_ranks_from_loads(&json!({"loads":[]})), None);
+        assert_eq!(decode_ranks_from_loads(&json!({})), None);
+    }
+
+    #[tokio::test]
+    async fn unavailable_server_info_can_bootstrap_only_verified_decode() {
+        for mode in ["decode", "prefill", "null"] {
+            let model = json!({"served_model_name":"m", "disaggregation_mode":mode});
+            let app = Router::new()
+                .route(
+                    "/server_info",
+                    get(|| async { axum::http::StatusCode::NOT_FOUND }),
+                )
+                .route(
+                    "/model_info",
+                    get(move || {
+                        let model = model.clone();
+                        async move { Json(model) }
+                    }),
+                )
+                .route("/v1/loads", get(|| async { Json(decode_loads()) }));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await });
+            let info = fast_introspector().fetch(&url).await;
+            assert_eq!(info.served_model_name.as_deref(), Some("m"));
+            if mode == "decode" {
+                assert_eq!(info.disaggregation_role, Some(DisaggregationRole::Decode));
+                assert_eq!(info.dp_ranks, 8);
+                assert!(info.event_config.is_none());
+            } else {
+                assert_eq!(info.disaggregation_role, None);
+                assert_eq!(info.dp_ranks, 1);
+            }
+            server.abort();
+        }
     }
 
     /// An engine started with `--api-key` answers `/server_info` only to the key.
