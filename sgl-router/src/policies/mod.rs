@@ -9,6 +9,7 @@ pub mod dp_rank;
 pub mod factory;
 pub mod load_based;
 pub mod power_of_two;
+pub(crate) mod prefill_guard;
 pub mod random;
 pub mod registry;
 pub mod round_robin;

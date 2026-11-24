@@ -9,7 +9,10 @@ use super::preparation::{
 };
 use crate::config::DpRankPolicy;
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
-use crate::policies::dp_rank::{expected_rank_tokens, prefill_work_rank, select_dp_rank};
+use crate::policies::dp_rank::{
+    budgeted_prefill_work_rank, expected_rank_tokens, legacy_prefill_work_rank, prefill_work_rank,
+    select_dp_rank,
+};
 use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
 use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
 use crate::proxy::Proxy;
@@ -773,14 +776,6 @@ fn prompt_dp_rank(
             ctx.engine_reported_load
                 .fresh_rank_loads(&worker.url, Instant::now()),
         ) {
-            let selected = prefill_work_rank(
-                worker,
-                cached_rank,
-                &placement.depths,
-                tokens.ids.len(),
-                block_size as usize,
-                &loads,
-            );
             let cached_tokens = |rank| {
                 placement
                     .depths
@@ -793,7 +788,73 @@ fn prompt_dp_rank(
                     .min(tokens.ids.len())
             };
             let baseline_uncached = (tokens.ids.len() - cached_tokens(cached_rank)) as u64;
+            let now = Instant::now();
+            let identity = request.prefill_residence_key();
+            let mut states = ctx.metrics.prefill_guard_states.lock();
+            let guard = states
+                .entry((request.model.0.clone(), worker.url.clone()))
+                .or_insert_with(|| crate::policies::prefill_guard::PrefillGuard::new(now));
+            let allowance = guard.allowance(now, baseline_uncached);
+            let resident = guard.resident(now, identity);
+            let legacy = legacy_prefill_work_rank(
+                worker,
+                cached_rank,
+                &placement.depths,
+                tokens.ids.len(),
+                block_size as usize,
+                &loads,
+            );
+            let local = prefill_work_rank(
+                worker,
+                cached_rank,
+                &placement.depths,
+                tokens.ids.len(),
+                block_size as usize,
+                &loads,
+            );
+            let window = budgeted_prefill_work_rank(
+                worker,
+                cached_rank,
+                &placement.depths,
+                tokens.ids.len(),
+                block_size as usize,
+                &loads,
+                allowance,
+                None,
+            );
+            let selected = budgeted_prefill_work_rank(
+                worker,
+                cached_rank,
+                &placement.depths,
+                tokens.ids.len(),
+                block_size as usize,
+                &loads,
+                allowance,
+                resident,
+            );
             let selected_uncached = (tokens.ids.len() - cached_tokens(selected)) as u64;
+            let extra = selected_uncached.saturating_sub(baseline_uncached);
+            guard.book(
+                now,
+                baseline_uncached,
+                extra,
+                identity,
+                cached_rank,
+                selected,
+            );
+            drop(states);
+            let legacy_extra = ((tokens.ids.len() - cached_tokens(legacy)) as u64)
+                .saturating_sub(baseline_uncached);
+            ctx.metrics.record_prefill_guard([
+                1,
+                u64::from(legacy != cached_rank),
+                u64::from(legacy != local),
+                u64::from(local != window),
+                u64::from(window != selected),
+                u64::from(identity.is_some()),
+                legacy_extra,
+                extra,
+            ]);
             let target_requests = loads
                 .iter()
                 .find(|l| l.rank == selected)

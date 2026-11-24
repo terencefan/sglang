@@ -77,6 +77,76 @@ pub fn prefill_work_rank(
     block_size: usize,
     loads: &[RankLoad],
 ) -> u32 {
+    prefill_work_rank_impl(
+        worker,
+        cached_rank,
+        prefix_depths,
+        prompt_tokens,
+        block_size,
+        loads,
+        u64::MAX,
+        None,
+        false,
+    )
+}
+
+/// Old rule is evaluated only as a counterfactual; never used to serve traffic.
+pub(crate) fn legacy_prefill_work_rank(
+    worker: &Worker,
+    cached_rank: u32,
+    prefix_depths: &[(u32, usize)],
+    prompt_tokens: usize,
+    block_size: usize,
+    loads: &[RankLoad],
+) -> u32 {
+    prefill_work_rank_impl(
+        worker,
+        cached_rank,
+        prefix_depths,
+        prompt_tokens,
+        block_size,
+        loads,
+        u64::MAX,
+        None,
+        true,
+    )
+}
+
+pub(crate) fn budgeted_prefill_work_rank(
+    worker: &Worker,
+    cached_rank: u32,
+    prefix_depths: &[(u32, usize)],
+    prompt_tokens: usize,
+    block_size: usize,
+    loads: &[RankLoad],
+    allowance: u64,
+    resident: Option<u32>,
+) -> u32 {
+    prefill_work_rank_impl(
+        worker,
+        cached_rank,
+        prefix_depths,
+        prompt_tokens,
+        block_size,
+        loads,
+        allowance,
+        resident,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefill_work_rank_impl(
+    worker: &Worker,
+    cached_rank: u32,
+    prefix_depths: &[(u32, usize)],
+    prompt_tokens: usize,
+    block_size: usize,
+    loads: &[RankLoad],
+    allowance: u64,
+    resident: Option<u32>,
+    legacy: bool,
+) -> u32 {
     let ranks = worker.dp_ranks();
     if cached_rank >= ranks || block_size == 0 || prompt_tokens == 0 {
         return cached_rank;
@@ -92,25 +162,29 @@ pub fn prefill_work_rank(
             .min(prompt_tokens)
     };
     let baseline_uncached = prompt_tokens - cached_tokens(cached_rank);
-    // Busy-to-busy moves may at most double the request's necessary uncached
-    // work (plus four pages). A full cold copy needs genuinely spare capacity,
-    // not merely a shorter queue. Otherwise a saturated fleet keeps moving
-    // long hot prefixes and amplifies its own prefill backlog.
-    let extra_budget = baseline_uncached.saturating_add(block_size.saturating_mul(4));
+    // Every destination, including an idle one, pays the same 25% + four
+    // pages cap. Attention-DP idle does not mean the EP group has spare compute.
+    let extra_budget = (if legacy {
+        baseline_uncached
+    } else {
+        baseline_uncached / 4
+    })
+    .saturating_add(block_size.saturating_mul(4));
     let eligible = |rank: u32| {
         if rank == cached_rank {
             return true;
         }
         let extra = cached_tokens(cached_rank).saturating_sub(cached_tokens(rank));
-        if extra <= extra_budget {
+        if extra <= extra_budget && (extra as u64) <= allowance {
             return true;
         }
-        loads.iter().find(|l| l.rank == rank).is_some_and(|l| {
-            l.num_reqs == 0
-                && l.pending_prefill_tokens == Some(0)
-                && worker.dp_rank_inflight(rank) == 0
-                && worker.dp_rank_dispatched_since(rank, l.at) == 0
-        })
+        legacy
+            && loads.iter().find(|l| l.rank == rank).is_some_and(|l| {
+                l.num_reqs == 0
+                    && l.pending_prefill_tokens == Some(0)
+                    && worker.dp_rank_inflight(rank) == 0
+                    && worker.dp_rank_dispatched_since(rank, l.at) == 0
+            })
     };
     let cost = |rank: u32| -> Option<u64> {
         let load = loads.iter().find(|load| load.rank == rank)?;
@@ -141,11 +215,23 @@ pub fn prefill_work_rank(
         .filter(|&(rank, _)| eligible(rank))
         .min_by_key(|&(rank, c)| (c, worker.dp_rank_inflight(rank), rank != cached_rank))
         .unwrap();
-    if best_cost.saturating_add((block_size as u64).saturating_mul(4)) < current {
+    let selected = if best_cost.saturating_add((block_size as u64).saturating_mul(4)) < current {
         best
     } else {
         cached_rank
+    };
+    // Residence is a preference within the existing four-page hysteresis, not
+    // a hard session route: a clearly better queue/cache choice still wins.
+    if !legacy {
+        if let Some(r) = resident.filter(|&r| r < ranks && eligible(r)) {
+            if let (Some(rc), Some(sc)) = (cost(r), cost(selected)) {
+                if rc <= sc.saturating_add((block_size as u64).saturating_mul(4)) {
+                    return r;
+                }
+            }
+        }
     }
+    selected
 }
 
 /// `None` for a single-rank worker. `prefix_depths` is `(rank, cached blocks)`;
@@ -242,6 +328,84 @@ mod tests {
         Worker::with_cb_config(spec, None, profile)
     }
 
+    #[test]
+    fn prefill_budget_caps_extra_work_even_for_idle_targets() {
+        let w = worker(2);
+        let at = Instant::now();
+        let loads = [
+            RankLoad {
+                rank: 0,
+                num_tokens: 0,
+                num_reqs: 1,
+                pending_prefill_tokens: Some(100_000),
+                at,
+            },
+            RankLoad {
+                rank: 1,
+                num_tokens: 0,
+                num_reqs: 0,
+                pending_prefill_tokens: Some(0),
+                at,
+            },
+        ];
+        let expensive = [(0, 351), (1, 320)]; // baseline 10144, extra 7936
+        assert_eq!(
+            legacy_prefill_work_rank(&w, 0, &expensive, 100_000, 256, &loads),
+            1
+        );
+        assert_eq!(
+            prefill_work_rank(&w, 0, &expensive, 100_000, 256, &loads),
+            0
+        );
+        let cheap = [(0, 351), (1, 338)]; // extra 3328 <= 25% * 10144 + 1024
+        assert_eq!(prefill_work_rank(&w, 0, &cheap, 100_000, 256, &loads), 1);
+        assert_eq!(
+            budgeted_prefill_work_rank(&w, 0, &cheap, 100_000, 256, &loads, 1000, None),
+            0
+        );
+        assert_eq!(
+            budgeted_prefill_work_rank(&w, 0, &cheap, 100_000, 256, &loads, 1000, Some(1)),
+            0
+        );
+        let warm = [(0, 351), (1, 351)];
+        assert_eq!(
+            budgeted_prefill_work_rank(&w, 0, &warm, 100_000, 256, &loads, 0, None),
+            1
+        );
+    }
+
+    #[test]
+    fn prefill_residence_yields_to_material_queue_improvement() {
+        let w = worker(2);
+        let at = Instant::now();
+        let mut loads = [
+            RankLoad {
+                rank: 0,
+                num_tokens: 0,
+                num_reqs: 1,
+                pending_prefill_tokens: Some(0),
+                at,
+            },
+            RankLoad {
+                rank: 1,
+                num_tokens: 0,
+                num_reqs: 1,
+                pending_prefill_tokens: Some(500),
+                at,
+            },
+        ];
+        let warm = [(0, 351), (1, 351)];
+        assert_eq!(
+            budgeted_prefill_work_rank(&w, 0, &warm, 100_000, 256, &loads, 0, Some(1)),
+            1
+        );
+        loads[1].pending_prefill_tokens = Some(2000);
+        assert_eq!(
+            budgeted_prefill_work_rank(&w, 0, &warm, 100_000, 256, &loads, 0, Some(1)),
+            0
+        );
+    }
+
     const LEAST: DpRankPolicy = DpRankPolicy::LeastInFlight;
     const TOKENS: DpRankPolicy = DpRankPolicy::LeastTokens;
 
@@ -256,8 +420,8 @@ mod tests {
             pending_prefill_tokens: pending,
             at,
         };
-        let cache = [(0, 39)]; // 9984 of 10000 tokens reusable on rank 0.
-        let mut loads = [reading(0, Some(8000)), reading(1, Some(0))];
+        let cache = [(0, 39), (1, 36)]; // A slightly less warm replica can take work.
+        let mut loads = [reading(0, Some(500)), reading(1, Some(0))];
         // A shorter queue is not worth recomputing the prompt.
         assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 0);
         loads[0].pending_prefill_tokens = Some(30000);
@@ -297,6 +461,8 @@ mod tests {
         // Overflowing depths clamp to the prompt; 500 tokens is below hysteresis.
         assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 0);
         loads[0].pending_prefill_tokens = Some(u64::MAX);
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 0);
+        let cache = [(0, usize::MAX), (1, usize::MAX)];
         assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 1);
         assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads[..1]), 0);
         loads[1].pending_prefill_tokens = None;
@@ -334,12 +500,12 @@ mod tests {
             prefill_work_rank(&w, 0, &[(0, 390), (1, 388)], 100_000, 256, &loads),
             1
         );
-        // A truly idle rank can expand capacity: balancing is not disabled.
+        // Idle cannot bypass the extra-compute budget in an EP group.
         loads[1].num_reqs = 0;
         loads[1].pending_prefill_tokens = Some(0);
         assert_eq!(
             prefill_work_rank(&w, 0, &[(0, 390)], 100_000, 256, &loads),
-            1
+            0
         );
         // A dispatch not yet published consumes that idle expansion slot.
         let _sent = w.dp_rank_timestamped_guard(1);
