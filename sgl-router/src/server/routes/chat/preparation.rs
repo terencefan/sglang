@@ -671,6 +671,9 @@ impl PreparedRequest {
         engine_rid: Option<&str>,
     ) -> Result<Bytes, ApiError> {
         if self.body.is_empty() {
+            if bootstrap.is_some() {
+                return Err(invalid_request());
+            }
             return Ok(self.body.clone());
         }
         let input_ids = self
@@ -2329,6 +2332,31 @@ mod tests {
                 r <= i64::MAX as u64,
                 "generate_room_id() returned {r} > i64::MAX; would wrap negative as torch.int64",
             );
+        }
+    }
+
+    #[test]
+    fn outgoing_pd_body_replaces_caller_bootstrap_fields_and_rejects_non_objects() {
+        let bootstrap = BootstrapFields {
+            host: "prefill".into(),
+            port: Some(18998),
+            room: 42,
+        };
+        let body = Bytes::from_static(br#"{"bootstrap_room":null,"bootstrap_host":"caller"}"#);
+        let output = build_outgoing_body(&body, None, None, Some(&bootstrap), &[], None).unwrap();
+        let value: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["bootstrap_room"], json!(42));
+        assert_eq!(value["bootstrap_host"], json!("prefill"));
+        for invalid in ["", "null", "[]"] {
+            assert!(build_outgoing_body(
+                &Bytes::from(invalid),
+                None,
+                None,
+                Some(&bootstrap),
+                &[],
+                None
+            )
+            .is_err());
         }
     }
 
