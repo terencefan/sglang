@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest::{Client, RequestBuilder, Url};
 use std::time::Duration;
 
