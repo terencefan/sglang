@@ -508,3 +508,12 @@ This reuses the native cursor-checked snapshot and replay bootstrap; it does
 not import state without stream continuity checks. Explicit peers and
 `--kv-peer-selector` are mutually exclusive. Keep the warm peer serving until
 the replacement is ready.
+
+### Backend abort authorization
+
+When engines protect `/abort_request` with an admin key, set
+`SGL_ROUTER_WORKER_ABORT_API_KEY` from an operator-owned secret in the Router
+process. It supplies a sensitive Bearer header only for cancellation requests;
+inference-client headers are left intact. The key is read from the environment,
+never a CLI argument, and must not be distributed to inference clients. Without
+this setting, abort requests retain the previous client-Authorization behavior.
