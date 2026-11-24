@@ -91,6 +91,7 @@ def _make_controller(
     ctl.round_robin_counter = 0
     ctl.health_round_robin_counter = 0
     ctl.dp_budget = DPBudget(num_dp_ranks=num_dp_ranks)
+    ctl.send_to_tokenizer = MagicMock(name="tokenizer")
     return ctl
 
 
@@ -108,6 +109,7 @@ def _req(
     """
     return SimpleNamespace(
         time_stats=time_stats,
+        http_worker_ipc="ipc:///tmp/test-http-worker",
         rid=rid,
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
@@ -499,10 +501,31 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
             ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=room))
             ctl.workers[expected_rank].send_pyobj.assert_called()
 
-    def test_requires_bootstrap_room(self):
+    def test_missing_room_aborts_only_bad_request_then_dispatches_next(self):
         ctl = _make_controller(num_dp_ranks=4)
-        with self.assertRaises(AssertionError):
-            ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=None))
+        for rank in (None, 3):
+            with self.subTest(explicit_rank=rank):
+                ctl.follow_bootstrap_room_scheduler(_req(routed_dp_rank=rank))
+        errors = ctl.send_to_tokenizer.send_pyobj.call_args_list
+        self.assertEqual(len(errors), 2)
+        for args in errors:
+            abort = args.args[0]
+            self.assertIsInstance(abort, AbortReq)
+            self.assertEqual(abort.rid, "USER")
+            self.assertEqual(abort.http_worker_ipc, "ipc:///tmp/test-http-worker")
+            self.assertEqual(abort.finished_reason["status_code"], 400)
+        for worker in ctl.workers:
+            worker.send_pyobj.assert_not_called()
+        ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=5))
+        ctl.workers[1].send_pyobj.assert_called_once()
+
+    def test_request_without_room_attribute_is_rejected(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        req = _req()
+        del req.bootstrap_room
+        ctl.follow_bootstrap_room_scheduler(req)
+        abort = ctl.send_to_tokenizer.send_pyobj.call_args.args[0]
+        self.assertEqual(abort.finished_reason["status_code"], 400)
 
     def test_routed_dp_rank_bypasses_bootstrap_room(self):
         ctl = _make_controller(num_dp_ranks=4)

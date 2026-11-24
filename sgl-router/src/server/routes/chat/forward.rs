@@ -51,6 +51,25 @@ pub(super) struct SelectedWorkers {
     pub(super) track_dispatch_timestamps: bool,
 }
 
+/// Fail closed if worker roles changed between selection and dispatch. In
+/// particular, never treat a prefill-only selection as a plain request: plain
+/// dispatch does not add the bootstrap room required by that engine.
+fn validate_pd_pair(prefill: &Worker, decode: Option<&Worker>) -> Result<(), ApiError> {
+    let valid = match decode {
+        Some(decode) => {
+            prefill.mode() == WorkerMode::Prefill && decode.mode() == WorkerMode::Decode
+        }
+        None => prefill.mode() == WorkerMode::Plain,
+    };
+    if !valid {
+        tracing::error!(worker = %prefill.url, mode = ?prefill.mode(), "invalid PD worker pairing; refusing dispatch");
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "invalid PD worker pairing"
+        )));
+    }
+    Ok(())
+}
+
 /// PD sends to both workers and returns the decode response.
 /// One dispatch attempt's client-ready response.
 pub(super) struct HttpDispatched {
@@ -180,6 +199,7 @@ async fn dispatch<T: Transport>(
         decode,
         track_dispatch_timestamps,
     } = workers;
+    validate_pd_pair(&prefill, decode.as_deref())?;
     let decode_url_header = decode
         .as_ref()
         .and_then(|worker| parse_decode_url_header(&worker.url));
@@ -1407,5 +1427,31 @@ mod tests {
             prefill_outcome(sse(&[chunk, "[DONE]"])).await,
             PrefillOutcome::Completed(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod pd_pair_guard_tests {
+    use super::*;
+    use crate::discovery::WorkerSpec;
+
+    fn worker(mode: WorkerMode) -> Worker {
+        Worker::new(WorkerSpec {
+            url: "http://127.0.0.1:8000".into(),
+            mode,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn refuses_unpaired_pd_worker_and_role_changes() {
+        let prefill = worker(WorkerMode::Prefill);
+        let decode = worker(WorkerMode::Decode);
+        assert!(validate_pd_pair(&prefill, None).is_err());
+        assert!(validate_pd_pair(&decode, None).is_err());
+        assert!(validate_pd_pair(&prefill, Some(&decode)).is_ok());
+        decode.set_mode(WorkerMode::Plain);
+        assert!(validate_pd_pair(&prefill, Some(&decode)).is_err());
+        assert!(validate_pd_pair(&worker(WorkerMode::Plain), None).is_ok());
     }
 }

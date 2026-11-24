@@ -29,6 +29,7 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.disaggregation.mode import validate_bootstrap_room
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_rank_to_dp_rank,
@@ -182,6 +183,11 @@ class DataParallelController:
         if get_parallel().node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+            )
+            # AbortReq preserves the HTTP worker return route, including when
+            # the receiver is the multi-HTTP-worker tokenizer router.
+            self.send_to_tokenizer = get_zmq_socket(
+                self.context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
 
         # Dispatch method
@@ -888,14 +894,36 @@ class DataParallelController:
         sock_send(self.workers[slot], req)
 
     def follow_bootstrap_room_scheduler(self, req: Req):
-        if self.maybe_external_dp_rank_routing(req):
+        # Reject malformed IPC requests as well as HTTP requests, including
+        # ones with an explicit rank. Never kill all workers for one bad room.
+        room = getattr(req, "bootstrap_room", None)
+        try:
+            validate_bootstrap_room(room)
+        except ValueError as error:
+            logger.warning(
+                "Rejected PD dispatch: rid=%s type=%s room_present=%s routed_dp_rank=%s",
+                req.rid,
+                type(req).__name__,
+                room is not None,
+                req.routed_dp_rank,
+            )
+            sock_send(
+                self.send_to_tokenizer,
+                AbortReq(
+                    rid=req.rid,
+                    http_worker_ipc=req.http_worker_ipc,
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": 400,
+                        "message": str(error),
+                    },
+                ),
+            )
             return
 
-        assert req.bootstrap_room is not None, (
-            "req.bootstrap_room should not be None. Do not send requests directly to "
-            "prefill or decode instances; send to the router instead."
-        )
-        target_rank = req.bootstrap_room % len(self.workers)
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        target_rank = room % len(self.workers)
         sock_send(self.workers[target_rank], req)
 
     def total_requests_scheduler(self, req: Req):

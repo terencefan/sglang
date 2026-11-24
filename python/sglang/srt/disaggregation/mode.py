@@ -17,3 +17,16 @@ class DisaggregationMode(Enum):
         elif mode == DisaggregationMode.DECODE.value:
             return "decode"
         return "unified"
+
+
+def validate_bootstrap_room(room) -> None:
+    """Validate one PD transfer ID before it reaches rank dispatch.
+
+    Zero is valid (including health/warmup requests). A routed rank cannot
+    substitute for the ID used to pair prefill and decode KV transfers.
+    """
+    if type(room) is not int or not -(1 << 63) <= room < (1 << 63):
+        raise ValueError(
+            "PD generation requires bootstrap_room to be a signed 64-bit integer. "
+            "Send inference requests through the PD router."
+        )

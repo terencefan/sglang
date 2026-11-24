@@ -65,7 +65,7 @@ from sglang.srt.beam_search.output import (
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
-from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode, validate_bootstrap_room
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_size_to_dp_size,
@@ -1064,6 +1064,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
 
+    def _validate_pd_bootstrap_request(self, obj, request=None) -> None:
+        # Validate every batch item before creating state or sending any item.
+        # Fake transfer assigns synthetic rooms during tokenization instead.
+        if (
+            isinstance(obj, GenerateReqInput)
+            and self.disaggregation_mode
+            in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE)
+            and get_disagg().disaggregation_transfer_backend != "fake"
+        ):
+            for item in (
+                [obj] if obj.is_single else (obj[i] for i in range(len(obj.rid)))
+            ):
+                try:
+                    validate_bootstrap_room(item.bootstrap_room)
+                except ValueError:
+                    logger.warning(
+                        "Rejected PD request: rid=%s type=%s path=%s source=%s "
+                        "room_present=%s routed_dp_rank=%s",
+                        item.rid,
+                        type(item).__name__,
+                        request.url.path if request is not None else None,
+                        request.client.host
+                        if request is not None and request.client
+                        else None,
+                        item.bootstrap_room is not None,
+                        item.routed_dp_rank,
+                    )
+                    raise
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1074,6 +1103,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
+        self._validate_pd_bootstrap_request(obj, request)
         if (
             isinstance(obj, GenerateReqInput)
             and obj.max_thinking_tokens is not None
