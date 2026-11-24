@@ -158,8 +158,8 @@ pub enum DecodePolicyKind {
     LegacyHostAffinity,
 }
 
-/// How `--dp-aware` picks a DP rank that no routing key or cached prefix decides,
-/// which in PD mode is every decode rank.
+/// How `--dp-aware` picks a DP rank. Except for `prefill_work`,
+/// explicit routing keys and cached prefixes take priority over load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum DpRankPolicy {
     /// The rank with the fewest requests this router has in flight on it.
@@ -176,6 +176,12 @@ pub enum DpRankPolicy {
     /// `least_in_flight`.
     #[value(name = "least_tokens")]
     LeastTokens,
+    /// Prefer cached prefixes unless another rank has materially less queued
+    /// uncached prefill work, including the cost of this request's cache miss.
+    /// Requires fresh native load reports for every rank; otherwise retains
+    /// prefix-first selection. Explicit sticky/session keys remain pinned.
+    #[value(name = "prefill_work")]
+    PrefillWork,
 }
 
 /// Role served by a static bucket.
@@ -543,7 +549,7 @@ pub struct CacheAwareConfig {
     /// External Indexer configuration when `prefix_provider = indexer`.
     pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
     /// Deadline for peer bootstrap, validated by `Config::validate`. Only
-    /// meaningful when a peer selector is set; see
+    /// meaningful with peer discovery or explicit bootstrap peers; see
     /// [`K8sDiscoveryConfig::peer_selector`].
     pub bootstrap_timeout_ms: u64,
     /// Upper bound on the per-fetch timeout derived from `bootstrap_timeout_ms`;
@@ -555,6 +561,8 @@ pub struct CacheAwareConfig {
     /// delays a failed seed's replica and a fleet-wide restart is a delay, not
     /// an outage.
     pub bootstrap_seed_required: bool,
+    /// Explicit warm router peers for static-discovery bootstrap.
+    pub bootstrap_peers: Vec<String>,
     /// How long a routed prompt credits its worker before KV events confirm
     /// it; 0 disables.
     pub pending_prefix_ttl_ms: u64,
@@ -578,6 +586,7 @@ impl Default for CacheAwareConfig {
             bootstrap_timeout_ms: DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
             bootstrap_fetch_timeout_cap_ms: DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
             bootstrap_seed_required: false,
+            bootstrap_peers: Vec::new(),
             pending_prefix_ttl_ms: 0,
             pending_prefix_max_followers: 0,
             media_affinity_ttl_ms: 0,

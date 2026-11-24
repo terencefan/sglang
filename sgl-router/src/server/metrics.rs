@@ -485,6 +485,13 @@ impl RouterInflightLoadKind {
 /// internal state is `Arc`/`Atomic`/`Mutex`-protected.
 #[derive(Debug, Default)]
 pub struct MetricsRegistry {
+    pub(crate) inference_inflight: Arc<crate::server::inflight::InflightHttp>,
+    // evaluated, warm spill, cold spill, baseline uncached, selected uncached,
+    // extra uncached, reported requests on cold destinations.
+    prefill_rank_work: [AtomicU64; 7],
+    prefill_guard_events: [AtomicU64; 8],
+    pub(crate) prefill_guard_states:
+        Mutex<HashMap<(String, String), crate::policies::prefill_guard::PrefillGuard>>,
     // Edge counters (recorded at the app.rs middleware): intake at entry,
     // responses at exit. `requests_total - responses_total` = received but
     // never answered, which `worker_requests_total` (post-dispatch) can't see.
@@ -888,6 +895,38 @@ impl MetricsRegistry {
             .fetch_add(count, Ordering::Relaxed);
     }
 
+    /// Same-cohort rank decisions and token-work estimates, not measured GPU
+    /// work. Native engine counters remain the actual recomputation authority.
+    pub fn record_prefill_rank_work(
+        &self,
+        baseline_uncached: u64,
+        selected_uncached: u64,
+        margin: u64,
+        moved: bool,
+        target_requests: u64,
+    ) {
+        let extra = selected_uncached.saturating_sub(baseline_uncached);
+        let cold = extra > baseline_uncached.saturating_add(margin);
+        let values = [
+            1,
+            u64::from(moved && !cold),
+            u64::from(moved && cold),
+            baseline_uncached,
+            selected_uncached,
+            extra,
+            if moved && cold { target_requests } else { 0 },
+        ];
+        for (counter, value) in self.prefill_rank_work.iter().zip(values) {
+            counter.fetch_add(value, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_prefill_guard(&self, values: [u64; 8]) {
+        for (counter, value) in self.prefill_guard_events.iter().zip(values) {
+            counter.fetch_add(value, Ordering::Relaxed);
+        }
+    }
+
     /// Pressure-guard pairs compared and overridden with complete monitor data.
     pub fn record_cache_pressure_guard(&self, compared: u64, overrides: u64) {
         self.cache_pressure_guard_compared_total
@@ -1031,6 +1070,54 @@ impl MetricsRegistry {
     /// `sgl_router_worker_*` gauge families.
     pub fn render_with_workers(&self, workers: &[WorkerSnapshot]) -> String {
         let mut out = String::new();
+        out.push_str("# HELP sgl_router_inference_inflight_requests Inference HTTP requests from ingress until response body completion or cancellation; excludes probes, metrics and count_tokens; each PD pair counts once.\n# TYPE sgl_router_inference_inflight_requests gauge\n");
+        out.push_str(&format!(
+            "sgl_router_inference_inflight_requests {}\n",
+            self.inference_inflight.count()
+        ));
+        out.push_str("# HELP sgl_router_prefill_guard_config_info Trial recompute admission policy; fractions price estimated extra uncached tokens, not GPU time.\n# TYPE sgl_router_prefill_guard_config_info gauge\nsgl_router_prefill_guard_config_info{per_request_fraction=\"0.25\",window_fraction=\"0.10\",window_seconds=\"60\",residence_seconds=\"60\"} 1\n");
+        for (i, name) in [
+            "decisions_total",
+            "legacy_migrations_total",
+            "local_restricted_total",
+            "window_restricted_total",
+            "residence_preferred_total",
+            "residence_key_total",
+            "legacy_extra_tokens_total",
+            "selected_extra_tokens_total",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let name = format!("sgl_router_prefill_guard_{name}");
+            out.push_str(&format!("# HELP {name} Same-snapshot migration admission observation; token values are estimates.\n# TYPE {name} counter\n{name} {}\n",self.prefill_guard_events[i].load(Ordering::Relaxed)));
+        }
+        for name in ["window_baseline_tokens", "window_extra_tokens", "residents"] {
+            out.push_str(&format!("# HELP sgl_router_prefill_guard_{name} Router-local per-worker rolling admission state.\n# TYPE sgl_router_prefill_guard_{name} gauge\n"));
+        }
+        for ((model, url), guard) in self.prefill_guard_states.lock().iter_mut() {
+            let (baseline, extra, residents) = guard.snapshot(std::time::Instant::now());
+            for (name, value) in [
+                ("window_baseline_tokens", baseline),
+                ("window_extra_tokens", extra),
+                ("residents", residents as u128),
+            ] {
+                out.push_str(&format!("sgl_router_prefill_guard_{name}{{model_id=\"{}\",worker_url=\"{}\"}} {value}\n",escape_label(model),escape_label(url)));
+            }
+        }
+
+        for (index,(name,help)) in [
+            ("decisions_total","Rank-work decisions with prompt tokens and fresh load readings."),
+            ("warm_spills_total","Rank changes within the busy-rank recomputation budget."),
+            ("cold_spills_total","Expensive prefix moves admitted only to idle ranks."),
+            ("baseline_uncached_tokens_total","Estimated uncached prompt tokens at the prefix-selected rank."),
+            ("selected_uncached_tokens_total","Estimated uncached prompt tokens at the selected rank."),
+            ("extra_uncached_tokens_total","Estimated extra prompt tokens introduced by rank migration; not measured engine work."),
+            ("cold_target_requests_total","Engine-reported running/waiting requests at cold migration targets; should stay zero."),
+        ].into_iter().enumerate() {
+            let name=format!("sgl_router_prefill_rank_{name}");
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n{name} {}\n",self.prefill_rank_work[index].load(Ordering::Relaxed)));
+        }
 
         // requests_total — edge intake (every request, counted before dispatch)
         out.push_str(
@@ -1624,6 +1711,27 @@ mod tests {
             output.lines().any(|line| line == expected),
             "missing metric line `{expected}`; got:\n{output}"
         );
+    }
+
+    #[test]
+    fn prefill_rank_metrics_share_a_decision_denominator() {
+        let reg = MetricsRegistry::new();
+        reg.record_prefill_rank_work(100, 100, 1024, false, 8);
+        reg.record_prefill_rank_work(100, 300, 1024, true, 3);
+        reg.record_prefill_rank_work(100, 10000, 1024, true, 0);
+        let out = reg.render();
+        for expected in [
+            "decisions_total 3",
+            "warm_spills_total 1",
+            "cold_spills_total 1",
+            "extra_uncached_tokens_total 10100",
+            "cold_target_requests_total 0",
+        ] {
+            assert!(
+                out.contains(&format!("sgl_router_prefill_rank_{expected}")),
+                "{expected}"
+            );
+        }
     }
 
     #[test]

@@ -75,8 +75,15 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
             ctx.block_size_oracle.get().unwrap_or(0),
         ));
     }
-    // A local tree alone does not mean peer bootstrap is on; the selector does.
-    if let (Some(index), Some(_)) = (ctx.kv_index.as_ref(), ctx.config.discovery.peer_selector()) {
+    // Bootstrap may use discovered siblings or explicit warm peers.
+    let peer_bootstrap = ctx.config.discovery.peer_selector().is_some()
+        || ctx
+            .config
+            .model
+            .cache_aware
+            .as_ref()
+            .is_some_and(|c| !c.bootstrap_peers.is_empty());
+    if let (Some(index), true) = (ctx.kv_index.as_ref(), peer_bootstrap) {
         body.push_str(&render_kv_peers(&index.peers()));
         body.push_str(&render_kv_bootstrap(
             &index.bootstrap(),
@@ -489,6 +496,16 @@ mod tests {
                 .contains("sgl_router_kv_bootstrap_peers"),
             "a router without --kv-peer-selector emits no peer series",
         );
+
+        let mut static_ctx = AppContext::stub();
+        static_ctx.kv_index = index.snapshot_source();
+        static_ctx.config.model.cache_aware = Some(crate::config::CacheAwareConfig {
+            bootstrap_peers: vec!["http://sibling:30000".into()],
+            ..Default::default()
+        });
+        assert!(scrape(Arc::new(static_ctx))
+            .await
+            .contains("sgl_router_kv_bootstrap_peers"));
 
         let mut ctx = AppContext::stub();
         ctx.kv_index = index.snapshot_source();

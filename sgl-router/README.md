@@ -392,6 +392,15 @@ unset fields inherit the CLI flags. See
   `--decode-dispatch-limit N` picks the decode rank shortly before the KV
   arrives; see
   [DP-rank routing](REFERENCE.md#dp-rank-routing).
+  `--dp-rank-policy prefill_work` can spill beyond the deepest-prefix ranks
+  when another rank's queued uncached tokens plus this prompt's cache miss
+  are lower by more than four cache pages. Host-backed prefix ownership counts
+  as cached. Fresh native load reports for every rank and a known cache block
+  size are required; otherwise selection stays prefix-first. Dispatches newer
+  than each report are conservatively charged at the current prompt size.
+  This estimates token work, not wall-clock latency or KV reload bandwidth.
+  Explicit sticky/session keys stay pinned. For PD, use
+  `--decode-dp-rank-policy least_in_flight` to keep decode selection unchanged.
 - **PD version groups**: `--pd-version-group-label <key>` pairs prefill and
   decode only within the same engine version; see
   [PD version groups](REFERENCE.md#pd-version-groups).
@@ -476,3 +485,35 @@ workflows run on every `v*` tag.
 ## License
 
 Apache-2.0.
+
+
+### Cache-preserving rank pressure
+
+`prefill_work` retains load balancing but bounds busy-to-busy recomputation.
+The extra uncached tokens of a move may not exceed the request's baseline
+uncached tokens plus four cache pages. Larger copies are admitted only when
+the destination has no engine-reported running/waiting requests, no pending
+uncached tokens, no local in-flight prefill leg and no dispatch since its last
+load report. Cold requests and similarly warm replicas still balance by work.
+
+Counters under `sgl_router_prefill_rank_*` expose one decision denominator,
+warm/cold moves, baseline/selected/extra estimated uncached tokens, and reported
+requests at cold destinations. These token counters are estimates from the
+routing index, not measured GPU work. Validate against native uncached prompt
+counters and total decode throughput.
+
+Static worker discovery can preserve a warm peer's KV index with
+`--kv-bootstrap-peer-url http://warm-router:18097 --kv-bootstrap-seed-required`.
+This reuses the native cursor-checked snapshot and replay bootstrap; it does
+not import state without stream continuity checks. Explicit peers and
+`--kv-peer-selector` are mutually exclusive. Keep the warm peer serving until
+the replacement is ready.
+
+### Backend abort authorization
+
+When engines protect `/abort_request` with an admin key, set
+`SGL_ROUTER_WORKER_ABORT_API_KEY` from an operator-owned secret in the Router
+process. It supplies a sensitive Bearer header only for cancellation requests;
+inference-client headers are left intact. The key is read from the environment,
+never a CLI argument, and must not be distributed to inference clients. Without
+this setting, abort requests retain the previous client-Authorization behavior.

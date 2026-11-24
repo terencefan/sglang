@@ -63,6 +63,177 @@ pub fn expected_rank_tokens(worker: &Worker, loads: &[RankLoad]) -> Vec<(u32, u6
         .collect()
 }
 
+/// Allow a cached request to spill only when saved queued work exceeds its
+/// recomputation cost plus four cache pages of hysteresis. Cache depths include
+/// host-backed entries: a GPU miss alone must not be charged as full prefill.
+/// Call with fresh reports; incomplete/native-field-missing reports fail closed.
+/// Dispatch stamps bridge load-publisher updates conservatively at this prompt's
+/// full size, so a burst cannot repeatedly choose the same apparently idle rank.
+pub fn prefill_work_rank(
+    worker: &Worker,
+    cached_rank: u32,
+    prefix_depths: &[(u32, usize)],
+    prompt_tokens: usize,
+    block_size: usize,
+    loads: &[RankLoad],
+) -> u32 {
+    prefill_work_rank_impl(
+        worker,
+        cached_rank,
+        prefix_depths,
+        prompt_tokens,
+        block_size,
+        loads,
+        u64::MAX,
+        None,
+        false,
+    )
+}
+
+/// Old rule is evaluated only as a counterfactual; never used to serve traffic.
+pub(crate) fn legacy_prefill_work_rank(
+    worker: &Worker,
+    cached_rank: u32,
+    prefix_depths: &[(u32, usize)],
+    prompt_tokens: usize,
+    block_size: usize,
+    loads: &[RankLoad],
+) -> u32 {
+    prefill_work_rank_impl(
+        worker,
+        cached_rank,
+        prefix_depths,
+        prompt_tokens,
+        block_size,
+        loads,
+        u64::MAX,
+        None,
+        true,
+    )
+}
+
+pub(crate) fn budgeted_prefill_work_rank(
+    worker: &Worker,
+    cached_rank: u32,
+    prefix_depths: &[(u32, usize)],
+    prompt_tokens: usize,
+    block_size: usize,
+    loads: &[RankLoad],
+    allowance: u64,
+    resident: Option<u32>,
+) -> u32 {
+    prefill_work_rank_impl(
+        worker,
+        cached_rank,
+        prefix_depths,
+        prompt_tokens,
+        block_size,
+        loads,
+        allowance,
+        resident,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefill_work_rank_impl(
+    worker: &Worker,
+    cached_rank: u32,
+    prefix_depths: &[(u32, usize)],
+    prompt_tokens: usize,
+    block_size: usize,
+    loads: &[RankLoad],
+    allowance: u64,
+    resident: Option<u32>,
+    legacy: bool,
+) -> u32 {
+    let ranks = worker.dp_ranks();
+    if cached_rank >= ranks || block_size == 0 || prompt_tokens == 0 {
+        return cached_rank;
+    }
+    let cached_tokens = |rank: u32| {
+        prefix_depths
+            .iter()
+            .filter(|&&(r, _)| r == rank)
+            .map(|&(_, depth)| depth)
+            .max()
+            .unwrap_or(0)
+            .saturating_mul(block_size)
+            .min(prompt_tokens)
+    };
+    let baseline_uncached = prompt_tokens - cached_tokens(cached_rank);
+    // Every destination, including an idle one, pays the same 25% + four
+    // pages cap. Attention-DP idle does not mean the EP group has spare compute.
+    let extra_budget = (if legacy {
+        baseline_uncached
+    } else {
+        baseline_uncached / 4
+    })
+    .saturating_add(block_size.saturating_mul(4));
+    let eligible = |rank: u32| {
+        if rank == cached_rank {
+            return true;
+        }
+        let extra = cached_tokens(cached_rank).saturating_sub(cached_tokens(rank));
+        if extra <= extra_budget && (extra as u64) <= allowance {
+            return true;
+        }
+        legacy
+            && loads.iter().find(|l| l.rank == rank).is_some_and(|l| {
+                l.num_reqs == 0
+                    && l.pending_prefill_tokens == Some(0)
+                    && worker.dp_rank_inflight(rank) == 0
+                    && worker.dp_rank_dispatched_since(rank, l.at) == 0
+            })
+    };
+    let cost = |rank: u32| -> Option<u64> {
+        let load = loads.iter().find(|load| load.rank == rank)?;
+        let pending = load.pending_prefill_tokens?;
+        let depth = prefix_depths
+            .iter()
+            .filter(|&&(r, _)| r == rank)
+            .map(|&(_, depth)| depth)
+            .max()
+            .unwrap_or(0);
+        let cached = depth.saturating_mul(block_size).min(prompt_tokens);
+        let dispatched = worker.dp_rank_dispatched_since(rank, load.at) as u64;
+        Some(
+            pending
+                .saturating_add(dispatched.saturating_mul(prompt_tokens as u64))
+                .saturating_add((prompt_tokens - cached) as u64),
+        )
+    };
+    let Some(costs) = (0..ranks)
+        .map(|rank| cost(rank).map(|c| (rank, c)))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return cached_rank;
+    };
+    let current = costs[cached_rank as usize].1;
+    let (best, best_cost) = costs
+        .into_iter()
+        .filter(|&(rank, _)| eligible(rank))
+        .min_by_key(|&(rank, c)| (c, worker.dp_rank_inflight(rank), rank != cached_rank))
+        .unwrap();
+    let selected = if best_cost.saturating_add((block_size as u64).saturating_mul(4)) < current {
+        best
+    } else {
+        cached_rank
+    };
+    // Residence is a preference within the existing four-page hysteresis, not
+    // a hard session route: a clearly better queue/cache choice still wins.
+    if !legacy {
+        if let Some(r) = resident.filter(|&r| r < ranks && eligible(r)) {
+            if let (Some(rc), Some(sc)) = (cost(r), cost(selected)) {
+                if rc <= sc.saturating_add((block_size as u64).saturating_mul(4)) {
+                    return r;
+                }
+            }
+        }
+    }
+    selected
+}
+
 /// `None` for a single-rank worker. `prefix_depths` is `(rank, cached blocks)`;
 /// `preferred` breaks a load tie among the deepest ranks (media affinity's
 /// rendezvous rank, so replicas agree) and never outranks load or depth;
@@ -157,8 +328,215 @@ mod tests {
         Worker::with_cb_config(spec, None, profile)
     }
 
+    #[test]
+    fn prefill_budget_caps_extra_work_even_for_idle_targets() {
+        let w = worker(2);
+        let at = Instant::now();
+        let loads = [
+            RankLoad {
+                rank: 0,
+                num_tokens: 0,
+                num_reqs: 1,
+                pending_prefill_tokens: Some(100_000),
+                at,
+            },
+            RankLoad {
+                rank: 1,
+                num_tokens: 0,
+                num_reqs: 0,
+                pending_prefill_tokens: Some(0),
+                at,
+            },
+        ];
+        let expensive = [(0, 351), (1, 320)]; // baseline 10144, extra 7936
+        assert_eq!(
+            legacy_prefill_work_rank(&w, 0, &expensive, 100_000, 256, &loads),
+            1
+        );
+        assert_eq!(
+            prefill_work_rank(&w, 0, &expensive, 100_000, 256, &loads),
+            0
+        );
+        let cheap = [(0, 351), (1, 338)]; // extra 3328 <= 25% * 10144 + 1024
+        assert_eq!(prefill_work_rank(&w, 0, &cheap, 100_000, 256, &loads), 1);
+        assert_eq!(
+            budgeted_prefill_work_rank(&w, 0, &cheap, 100_000, 256, &loads, 1000, None),
+            0
+        );
+        assert_eq!(
+            budgeted_prefill_work_rank(&w, 0, &cheap, 100_000, 256, &loads, 1000, Some(1)),
+            0
+        );
+        let warm = [(0, 351), (1, 351)];
+        assert_eq!(
+            budgeted_prefill_work_rank(&w, 0, &warm, 100_000, 256, &loads, 0, None),
+            1
+        );
+    }
+
+    #[test]
+    fn prefill_residence_yields_to_material_queue_improvement() {
+        let w = worker(2);
+        let at = Instant::now();
+        let mut loads = [
+            RankLoad {
+                rank: 0,
+                num_tokens: 0,
+                num_reqs: 1,
+                pending_prefill_tokens: Some(0),
+                at,
+            },
+            RankLoad {
+                rank: 1,
+                num_tokens: 0,
+                num_reqs: 1,
+                pending_prefill_tokens: Some(500),
+                at,
+            },
+        ];
+        let warm = [(0, 351), (1, 351)];
+        assert_eq!(
+            budgeted_prefill_work_rank(&w, 0, &warm, 100_000, 256, &loads, 0, Some(1)),
+            1
+        );
+        loads[1].pending_prefill_tokens = Some(2000);
+        assert_eq!(
+            budgeted_prefill_work_rank(&w, 0, &warm, 100_000, 256, &loads, 0, Some(1)),
+            0
+        );
+    }
+
     const LEAST: DpRankPolicy = DpRankPolicy::LeastInFlight;
     const TOKENS: DpRankPolicy = DpRankPolicy::LeastTokens;
+
+    #[test]
+    fn prefill_work_balances_queue_against_cache_and_unreported_dispatches() {
+        let w = worker(2);
+        let at = Instant::now() - Duration::from_millis(1);
+        let reading = |rank, pending| RankLoad {
+            rank,
+            num_tokens: 0,
+            num_reqs: 0,
+            pending_prefill_tokens: pending,
+            at,
+        };
+        let cache = [(0, 39), (1, 36)]; // A slightly less warm replica can take work.
+        let mut loads = [reading(0, Some(500)), reading(1, Some(0))];
+        // A shorter queue is not worth recomputing the prompt.
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 0);
+        loads[0].pending_prefill_tokens = Some(30000);
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 1);
+        // A burst must be counted before its next load-publisher update.
+        let _sent: Vec<_> = (0..3).map(|_| w.dp_rank_timestamped_guard(1)).collect();
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 0);
+        // Complete the prefill leg before considering a cold target idle again.
+        drop(_sent);
+        for load in &mut loads {
+            load.at = Instant::now() + Duration::from_secs(1);
+        }
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 1);
+    }
+
+    #[test]
+    fn prefill_work_fails_closed_and_preserves_cache_on_small_gains() {
+        let w = worker(2);
+        let at = Instant::now();
+        let mut loads = [
+            RankLoad {
+                rank: 0,
+                num_tokens: 0,
+                num_reqs: 0,
+                pending_prefill_tokens: Some(10500),
+                at,
+            },
+            RankLoad {
+                rank: 1,
+                num_tokens: 0,
+                num_reqs: 0,
+                pending_prefill_tokens: Some(0),
+                at,
+            },
+        ];
+        let cache = [(0, usize::MAX), (99, usize::MAX)];
+        // Overflowing depths clamp to the prompt; 500 tokens is below hysteresis.
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 0);
+        loads[0].pending_prefill_tokens = Some(u64::MAX);
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 0);
+        let cache = [(0, usize::MAX), (1, usize::MAX)];
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 1);
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads[..1]), 0);
+        loads[1].pending_prefill_tokens = None;
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 256, &loads), 0);
+        assert_eq!(prefill_work_rank(&w, 0, &cache, 10000, 0, &loads), 0);
+    }
+
+    #[test]
+    fn saturated_ranks_preserve_hot_prefix_but_balance_warm_replicas() {
+        let w = worker(2);
+        let at = Instant::now();
+        let mut loads = [
+            RankLoad {
+                rank: 0,
+                num_tokens: 0,
+                num_reqs: 10,
+                pending_prefill_tokens: Some(1_000_000),
+                at,
+            },
+            RankLoad {
+                rank: 1,
+                num_tokens: 0,
+                num_reqs: 1,
+                pending_prefill_tokens: Some(1),
+                at,
+            },
+        ];
+        // An attractive short queue must not repeatedly recompute a 100k prefix.
+        assert_eq!(
+            prefill_work_rank(&w, 0, &[(0, 390)], 100_000, 256, &loads),
+            0
+        );
+        // A similarly warm replica can still take load while busy.
+        assert_eq!(
+            prefill_work_rank(&w, 0, &[(0, 390), (1, 388)], 100_000, 256, &loads),
+            1
+        );
+        // Idle cannot bypass the extra-compute budget in an EP group.
+        loads[1].num_reqs = 0;
+        loads[1].pending_prefill_tokens = Some(0);
+        assert_eq!(
+            prefill_work_rank(&w, 0, &[(0, 390)], 100_000, 256, &loads),
+            0
+        );
+        // A dispatch not yet published consumes that idle expansion slot.
+        let _sent = w.dp_rank_timestamped_guard(1);
+        assert_eq!(
+            prefill_work_rank(&w, 0, &[(0, 390)], 100_000, 256, &loads),
+            0
+        );
+    }
+
+    #[test]
+    fn cold_requests_balance_without_extra_recomputation() {
+        let w = worker(2);
+        let at = Instant::now();
+        let loads = [
+            RankLoad {
+                rank: 0,
+                num_tokens: 0,
+                num_reqs: 20,
+                pending_prefill_tokens: Some(1_000_000),
+                at,
+            },
+            RankLoad {
+                rank: 1,
+                num_tokens: 0,
+                num_reqs: 2,
+                pending_prefill_tokens: Some(10_000),
+                at,
+            },
+        ];
+        assert_eq!(prefill_work_rank(&w, 0, &[], 100_000, 256, &loads), 1);
+    }
 
     #[test]
     fn affinity_then_prefix_then_load() {
@@ -248,6 +626,7 @@ mod tests {
             rank,
             num_tokens,
             num_reqs,
+            pending_prefill_tokens: None,
             at,
         };
         let at = Instant::now();

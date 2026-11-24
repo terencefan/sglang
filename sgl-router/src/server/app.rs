@@ -127,6 +127,21 @@ async fn access_log_and_record(
     let start = std::time::Instant::now();
 
     ctx.metrics.record_ingress(&route, method_label);
+    let inference = ((method_label == "POST" || (method_label == "PUT" && route == "/generate"))
+        && matches!(
+            route.as_str(),
+            "/generate"
+                | "/v1/responses"
+                | "/v1/chat/completions"
+                | "/v1/completions"
+                | "/v1/messages"
+                | "/v1/embeddings"
+                | "/v1/rerank"
+                | "/rerank"
+                | "/classify"
+                | "/score"
+        ))
+    .then(|| ctx.metrics.inference_inflight.enter());
     let inflight = ctx.inflight_http.enter();
     let resp = next.run(req).await;
     let status = resp.status();
@@ -172,7 +187,13 @@ async fn access_log_and_record(
             "http_request",
         );
     }
-    resp.map(|body| crate::server::inflight::track_body(body, inflight))
+    resp.map(|body| {
+        let body = crate::server::inflight::track_body(body, inflight);
+        match inference {
+            Some(guard) => crate::server::inflight::track_body(body, guard),
+            None => body,
+        }
+    })
 }
 
 /// Middleware: log 413 PAYLOAD_TOO_LARGE responses with the request method and
@@ -385,6 +406,102 @@ mod tests {
     use std::sync::Mutex;
     use tower::ServiceExt;
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[tokio::test]
+    async fn inference_gauge_holds_streams_but_excludes_observability() {
+        let ctx = Arc::new(AppContext::stub());
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(|| async {
+                    Body::from_stream(futures::stream::pending::<
+                        Result<bytes::Bytes, std::io::Error>,
+                    >())
+                }),
+            )
+            .route("/metrics", get(|| async { "metrics" }))
+            .route("/v1/messages/count_tokens", post(|| async { "tokens" }))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&ctx),
+                access_log_and_record,
+            ));
+        for (method, path) in [("GET", "/metrics"), ("POST", "/v1/messages/count_tokens")] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ctx.metrics.inference_inflight.count(), 0);
+            drop(response);
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.metrics.inference_inflight.count(),
+            1,
+            "response headers do not finish SSE"
+        );
+        assert!(ctx
+            .metrics
+            .render()
+            .contains("sgl_router_inference_inflight_requests 1"));
+        drop(response);
+        assert_eq!(
+            ctx.metrics.inference_inflight.count(),
+            0,
+            "client disconnect releases once"
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_gauge_releases_when_cancelled_before_headers() {
+        let ctx = Arc::new(AppContext::stub());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let signal = Arc::clone(&entered);
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(move || {
+                    let signal = Arc::clone(&signal);
+                    async move {
+                        signal.notify_one();
+                        std::future::pending::<String>().await
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&ctx),
+                access_log_and_record,
+            ));
+        let task = tokio::spawn(
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        entered.notified().await;
+        assert_eq!(ctx.metrics.inference_inflight.count(), 1);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(ctx.metrics.inference_inflight.count(), 0);
+    }
 
     /// Capture the `tracing` output of one test into a buffer.
     #[derive(Clone)]

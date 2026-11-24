@@ -82,6 +82,47 @@ fn namespace_field(value: &Value) -> Result<Option<String>, ()> {
     Ok(value.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
 }
 
+fn prefill_residence_key(
+    body: &Value,
+    model: &str,
+    namespace: &CacheNamespace,
+) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    if namespace.ambiguous {
+        return None;
+    }
+    let metadata = &body["metadata"];
+    let encoded_user: Option<Value> = metadata["user_id"]
+        .as_str()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let session = metadata["session_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            encoded_user
+                .as_ref()
+                .and_then(|v| v["session_id"].as_str())
+                .filter(|s| !s.is_empty())
+        });
+    let messages = body["messages"].as_array();
+    let first_user = messages.and_then(|m| m.iter().find(|m| m["role"] == "user"));
+    if session.is_none() && first_user.is_none() {
+        return None;
+    }
+    let prefix: Vec<&Value> = messages
+        .into_iter()
+        .flatten()
+        .take_while(|m| m["role"] != "user")
+        .collect();
+    let identity = if let Some(id) = session {
+        json!({"session":id})
+    } else {
+        json!({"first_user":first_user})
+    };
+    let encoded = serde_json::to_vec(&json!({"v":1,"model":model,"salt":namespace.cache_salt,"lora":namespace.lora_name,"system":body.get("system"),"tools":body.get("tools"),"prefix":prefix,"identity":identity})).ok()?;
+    Some(Sha256::digest(encoded).into())
+}
+
 /// Validated routing inputs and the original body, ready for worker selection.
 ///
 /// Each `/generate` prompt and `n` sample is its own engine request: input and output
@@ -124,6 +165,15 @@ pub(super) struct PreparedRequest {
 }
 
 impl PreparedRequest {
+    /// A soft residence key, never an engine cache key or a hard sticky route.
+    /// Shared system/tools alone must not pin unrelated conversations together.
+    pub(super) fn prefill_residence_key(&self) -> Option<[u8; 32]> {
+        if let Some(body) = self.parsed_body.as_ref() {
+            return prefill_residence_key(body, &self.model.0, &self.cache_namespace);
+        }
+        let body: Value = serde_json::from_slice(&self.body).ok()?;
+        prefill_residence_key(&body, &self.model.0, &self.cache_namespace)
+    }
     /// OpenAI chat and completions go to the engine's `/generate` when SGLang's
     /// OpenAI layer is reproduced for them, else to its own route as sent.
     pub(super) fn openai(
@@ -1925,6 +1975,35 @@ pub(crate) fn enforce_minimax_m31_thinking(value: &mut Value) -> Result<bool, Ap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefill_residence_identifies_sessions_without_shared_prompt_pinning() {
+        let ns = CacheNamespace::default();
+        let a =
+            json!({"system":"shared", "tools":[], "messages":[{"role":"user","content":"task A"}]});
+        let mut b = a.clone();
+        b["messages"][0]["content"] = json!("task B");
+        let key = |body: &Value| prefill_residence_key(body, "model", &ns);
+        assert_ne!(key(&a), key(&b));
+        let mut appended = a.clone();
+        appended["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","content":"answer"}),
+            json!({"role":"user","content":"next"}),
+        ]);
+        assert_eq!(key(&a), key(&appended));
+        let mut session_a = a.clone();
+        session_a["metadata"] = json!({"user_id":"{\"session_id\":\"session-A\"}"});
+        let mut compacted = b.clone();
+        compacted["metadata"] = session_a["metadata"].clone();
+        assert_eq!(key(&session_a), key(&compacted));
+        compacted["system"] = json!("different system");
+        assert_ne!(key(&session_a), key(&compacted));
+        assert_eq!(key(&json!({"system":"shared"})), None);
+        let mut salted = CacheNamespace::default();
+        salted.cache_salt = Some("isolated".into());
+        assert_ne!(key(&a), prefill_residence_key(&a, "model", &salted));
+        assert_ne!(key(&a), prefill_residence_key(&a, "other-model", &ns));
+    }
 
     #[test]
     fn minimax_m31_thinking_contract() {
