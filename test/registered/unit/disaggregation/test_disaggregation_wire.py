@@ -3629,6 +3629,35 @@ def _make_dsv4_draft(*, unified, mapping=None, swa_valid_from=None):
 
 
 class TestDSV4DraftStateRegistration(unittest.TestCase):
+    def test_pd_dspark_roles_register_both_draft_swa_and_request_mark(self):
+        from sglang.srt.disaggregation.utils import check_state_wire, state_wire
+
+        # Independent role-local mappings and buffers: wire compatibility must
+        # not depend on equal pointers or equal request-slot capacities.
+        args = []
+        pools = []
+        for slots in (3, 5):
+            mapping = torch.arange(16)
+            target = _make_dsv4_target(unified=False, mapping=mapping)
+            draft = _make_dsv4_draft(
+                unified=False, mapping=mapping,
+                swa_valid_from=torch.zeros(slots, dtype=torch.int64),
+            )
+            kv_args = KVArgs()
+            setup_state_kv_args(kv_args, _static_storage(target, draft), draft)
+            self.assertEqual(kv_args.state_types,
+                             [StateType.SWA, StateType.SWA, StateType.REQUEST_ROW])
+            args.append(kv_args)
+            pools.append((target, draft))
+        check_state_wire(state_wire(args[0]), state_wire(args[1]))
+        self.assertNotEqual(args[0].state_data_ptrs[-1], args[1].state_data_ptrs[-1])
+        non_spec = KVArgs()
+        target = _make_dsv4_target(unified=False, mapping=torch.arange(16))
+        setup_state_kv_args(non_spec, _static_storage(target))
+        for prefill, decode in ((non_spec, args[1]), (args[0], non_spec)):
+            with self.assertRaisesRegex(RuntimeError, "PD state entry mismatch"):
+                check_state_wire(state_wire(prefill), state_wire(decode))
+
     def test_draft_state_is_a_separate_component(self):
         mapping = torch.arange(16)
         cases = [
