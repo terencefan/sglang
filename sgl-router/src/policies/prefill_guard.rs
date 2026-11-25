@@ -28,6 +28,8 @@ pub(crate) struct PrefillGuard {
     baseline: u128,
     extra: u128,
     residents: HashMap<[u8; 32], Resident>,
+    pressure: HashMap<u32, (Instant, Instant)>,
+    overflow_targets: HashMap<u32, Instant>,
 }
 impl PrefillGuard {
     pub(crate) fn new(now: Instant) -> Self {
@@ -37,6 +39,8 @@ impl PrefillGuard {
             baseline: 0,
             extra: 0,
             residents: HashMap::new(),
+            pressure: HashMap::new(),
+            overflow_targets: HashMap::new(),
         }
     }
     fn tick(&self, now: Instant) -> u64 {
@@ -116,6 +120,46 @@ impl PrefillGuard {
             }
         }
     }
+    /// Only continuously refreshed, measured queues can open the escape hatch.
+    /// A missing feed or >5s gap restarts the 10s persistence timer.
+    pub(crate) fn congested_ranks(
+        &mut self,
+        loads: &[crate::state::load_monitor::engine_reported_load::RankLoad],
+        now: Instant,
+    ) -> Vec<u32> {
+        self.pressure
+            .retain(|rank, _| loads.iter().any(|l| l.rank == *rank));
+        let mut congested = Vec::new();
+        for l in loads {
+            let overloaded = l.num_reqs >= 8
+                && l.prefill_tokens_per_second.is_some_and(|rate| {
+                    rate > 0
+                        && l.pending_prefill_tokens
+                            .is_some_and(|p| u128::from(p) >= u128::from(rate) * 10)
+                });
+            if !overloaded || now.saturating_duration_since(l.at) > Duration::from_secs(5) {
+                self.pressure.remove(&l.rank);
+                continue;
+            }
+            let entry = self.pressure.entry(l.rank).or_insert((l.at, l.at));
+            if l.at.saturating_duration_since(entry.1) > Duration::from_secs(5) {
+                *entry = (l.at, l.at);
+            }
+            entry.1 = entry.1.max(l.at);
+            if entry.1.saturating_duration_since(entry.0) >= Duration::from_secs(10) {
+                congested.push(l.rank);
+            }
+        }
+        congested
+    }
+    pub(crate) fn overflow_target_ready(&self, rank: u32, now: Instant) -> bool {
+        self.overflow_targets
+            .get(&rank)
+            .is_none_or(|last| now.saturating_duration_since(*last) >= Duration::from_secs(2))
+    }
+    pub(crate) fn book_overflow(&mut self, rank: u32, now: Instant) {
+        self.overflow_targets.insert(rank, now);
+    }
     pub(crate) fn snapshot(&mut self, now: Instant) -> (u128, u128, usize) {
         self.prune(now);
         (self.baseline, self.extra, self.residents.len())
@@ -125,6 +169,40 @@ impl PrefillGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn overflow_needs_sustained_fresh_pressure_and_rate_limits_targets() {
+        use crate::state::load_monitor::engine_reported_load::RankLoad;
+        let t = Instant::now();
+        let mut g = PrefillGuard::new(t);
+        let mut l = RankLoad {
+            rank: 7,
+            num_tokens: 0,
+            num_reqs: 64,
+            pending_prefill_tokens: Some(1_000_000),
+            prefill_tokens_per_second: Some(20_000),
+            at: t,
+        };
+        assert!(g.congested_ranks(&[l], t).is_empty());
+        // Repeated decisions against one reading cannot manufacture persistence.
+        assert!(g
+            .congested_ranks(&[l], t + Duration::from_secs(10))
+            .is_empty());
+        for second in 11..=21 {
+            l.at = t + Duration::from_secs(second);
+            let ranks = g.congested_ranks(&[l], l.at);
+            assert_eq!(ranks.contains(&7), second == 21);
+        }
+        assert!(g.overflow_target_ready(0, l.at));
+        g.book_overflow(0, l.at);
+        assert!(!g.overflow_target_ready(0, l.at + Duration::from_secs(1)));
+        assert!(g.overflow_target_ready(0, l.at + Duration::from_secs(2)));
+        l.pending_prefill_tokens = Some(0);
+        assert!(g.congested_ranks(&[l], l.at).is_empty());
+        l.pending_prefill_tokens = Some(1_000_000);
+        assert!(g.congested_ranks(&[l], l.at).is_empty());
+        l.at += Duration::from_secs(11);
+        assert!(g.congested_ranks(&[l], l.at).is_empty());
+    }
     #[test]
     fn window_credit_and_expiry_are_not_an_unbounded_token_bank() {
         let t = Instant::now();

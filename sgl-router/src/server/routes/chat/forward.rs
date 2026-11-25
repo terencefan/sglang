@@ -10,8 +10,8 @@ use super::preparation::{
 use crate::config::DpRankPolicy;
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::dp_rank::{
-    budgeted_prefill_work_rank, expected_rank_tokens, legacy_prefill_work_rank, prefill_work_rank,
-    select_dp_rank,
+    budgeted_prefill_work_rank, expected_rank_tokens, legacy_prefill_work_rank,
+    prefill_overflow_rank, prefill_work_rank, select_dp_rank,
 };
 use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
 use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
@@ -842,7 +842,7 @@ fn prompt_dp_rank(
                 allowance,
                 None,
             );
-            let selected = budgeted_prefill_work_rank(
+            let mut selected = budgeted_prefill_work_rank(
                 worker,
                 cached_rank,
                 &placement.depths,
@@ -852,6 +852,29 @@ fn prompt_dp_rank(
                 allowance,
                 resident,
             );
+            let residence_selected = selected;
+            let congested = guard.congested_ranks(&loads, now);
+            let overflow = prefill_overflow_rank(
+                worker,
+                cached_rank,
+                selected,
+                &placement.depths,
+                tokens.ids.len(),
+                block_size as usize,
+                &loads,
+                allowance,
+                &congested,
+                |rank| guard.overflow_target_ready(rank, now),
+            );
+            ctx.metrics
+                .record_prefill_overflow(congested.contains(&cached_rank), overflow.as_ref());
+            if let Some(o) = overflow {
+                guard.book_overflow(o.rank, now);
+                selected = o.rank;
+                tracing::info!(worker = %worker.url, from_rank = cached_rank, to_rank = o.rank,
+                    source_queue_ms = o.source_queue_ms, predicted_finish_ms = o.predicted_finish_ms,
+                    extra_tokens = o.extra_tokens, "prefill sustained queue overflow");
+            }
             let selected_uncached = (tokens.ids.len() - cached_tokens(selected)) as u64;
             let extra = selected_uncached.saturating_sub(baseline_uncached);
             guard.book(
@@ -870,7 +893,7 @@ fn prompt_dp_rank(
                 u64::from(legacy != cached_rank),
                 u64::from(legacy != local),
                 u64::from(local != window),
-                u64::from(window != selected),
+                u64::from(window != residence_selected),
                 u64::from(identity.is_some()),
                 legacy_extra,
                 extra,

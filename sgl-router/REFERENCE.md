@@ -823,3 +823,35 @@ The legacy `--cache-threshold`, `--balance-abs-threshold`, and
 `--balance-rel-threshold` flags have also been removed. They do not have
 one-to-one replacements; remove them and review the current `sgl-router
 --help` output when tuning Cache-Aware routing.
+
+## Sustained Prefill queue overflow
+
+With `--dp-rank-policy prefill_work`, the normal 25% + four-page extra
+recomputation cap remains in place. A bounded escape hatch can exceed that
+per-request cap when the cache owner's estimated queue exceeds 10 seconds,
+with at least eight running/waiting requests, across 10 seconds of fresh
+load observations. A feed gap over five seconds, low queue or counter reset
+restarts persistence. Explicit sticky/session headers keep their existing path.
+
+Rank processing rates use an EWMA (1/8 new sample) of uncached tokens per busy
+second from two monotonic native load samples; idle updates retain a measured
+rate. Estimates include queued uncached work, full-prompt charges for dispatches
+not yet visible in the load feed, and this request's uncached input. An additional
+extra-tokens / slowest-rank-rate term conservatively prices shared EP work.
+These are scheduling estimates, not measured request latency or spare GPU capacity.
+
+An overflow destination must have at most four reported requests, no dispatch
+since its latest report, and a two-second router-local cooldown. Predicted cost
+must be less than half of staying with the cache owner and improve the ordinary
+selection by over five seconds. Extra work is capped at 131,072 tokens per move
+and charged under the same mutex to the existing per-worker, per-router 60-second
+10% rolling admission ledger. This is not a cross-replica global budget. Requests
+already dispatched are never replayed or moved. This bounds compute overhead;
+it cannot promise a queue limit if the budget is exhausted or no target qualifies.
+
+`sgl_router_prefill_overflow_{pressured_decisions,admissions,extra_tokens}_total`
+and `sgl_router_prefill_overflow_config_info` expose the new policy. Admission
+logs include source/target rank, estimated source queue, predicted destination
+cost and extra token charge. Existing residence counters continue to describe
+only residence decisions. Validate queue distribution alongside actual uncached
+compute, cache reuse, errors and decode throughput before claiming improvement.
