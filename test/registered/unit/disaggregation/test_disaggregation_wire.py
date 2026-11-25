@@ -3640,13 +3640,16 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
             mapping = torch.arange(16)
             target = _make_dsv4_target(unified=False, mapping=mapping)
             draft = _make_dsv4_draft(
-                unified=False, mapping=mapping,
+                unified=False,
+                mapping=mapping,
                 swa_valid_from=torch.zeros(slots, dtype=torch.int64),
             )
             kv_args = KVArgs()
             setup_state_kv_args(kv_args, _static_storage(target, draft), draft)
-            self.assertEqual(kv_args.state_types,
-                             [StateType.SWA, StateType.SWA, StateType.REQUEST_ROW])
+            self.assertEqual(
+                kv_args.state_types,
+                [StateType.SWA, StateType.SWA, StateType.REQUEST_ROW],
+            )
             args.append(kv_args)
             pools.append((target, draft))
         check_state_wire(state_wire(args[0]), state_wire(args[1]))
@@ -3678,7 +3681,8 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 item_lens = [[32], [32], [8]]
                 manager = object.__new__(MooncakeKVManager)
                 manager.kv_args = SimpleNamespace(
-                    engine_rank=rank, kv_data_ptrs=[],
+                    engine_rank=rank,
+                    kv_data_ptrs=[],
                     state_types=[StateType.SWA, StateType.SWA, StateType.REQUEST_ROW],
                     state_data_ptrs=[[a.ctypes.data] for a in source],
                     state_item_lens=item_lens,
@@ -3702,7 +3706,8 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
 
                 manager._transfer_data = copy_state
                 req = SimpleNamespace(
-                    room=42, mooncake_session_id="decode",
+                    room=42,
+                    mooncake_session_id="decode",
                     dst_state_indices=destination_indices,
                 )
                 peer = SimpleNamespace(
@@ -3714,7 +3719,9 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 )
                 with get_context().override_server_args(enable_unified_memory=False):
                     rc = manager.maybe_send_extra(
-                        req, source_indices, None,
+                        req,
+                        source_indices,
+                        None,
                         target_rank_registration_info=peer,
                     )
                 self.assertEqual(rc, 0)
