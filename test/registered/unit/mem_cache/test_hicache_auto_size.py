@@ -3,7 +3,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.mem_cache import hicache_auto_size as sizing
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -223,6 +222,56 @@ class TestHiCacheAutoSize(CustomTestCase):
         self.assertIsNone(
             resolution_result(explicit, "hicache_host_memory_fraction", 0.8)
         )
+
+    def test_deepseek_v4_requires_explicit_ratio_before_host_allocation(self):
+        # The V4 host assembler uses compressed region/page geometry which this
+        # generic auto-sizer cannot estimate. Reproduce the production gate on
+        # CPU, rather than relying on the MHA sizing tests to cover V4.
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            _deepseek_v4_num_host_pages,
+        )
+
+        pool = _leaf(DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool))
+        pool.size = 1024
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=SimpleNamespace(holds_state_slots=False),
+            token_to_kv_pool_allocator=Mock(
+                get_kvcache=Mock(return_value=pool), size_full=1024, storage=None
+            ),
+            page_size=256,
+        )
+        with self.assertRaisesRegex(ValueError, "does not support DeepSeekV4"):
+            sizing._estimate_hicache_bytes(params, None)
+
+        explicit = ServerArgs(model_path="dummy", hicache_ratio=0.5)
+        explicit.resolve_once()
+        fraction = resolution_result(explicit, "hicache_host_memory_fraction", 0.8)
+        self.assertIsNone(fraction)
+        with (
+            get_context().override_server_args(
+                enable_hierarchical_cache=True,
+                hicache_ratio=0.5,
+                hicache_size=0,
+                hicache_host_memory_fraction=fraction,
+            ),
+            patch.object(sizing, "_estimate_hicache_bytes") as estimate,
+            sizing.auto_size_hicache(params, None, enabled=True),
+        ):
+            self.assertIsNone(get_memory().hicache_host_memory_fraction)
+            self.assertEqual(get_memory().hicache_ratio, 0.5)
+            self.assertEqual(
+                _deepseek_v4_num_host_pages(
+                    params=params,
+                    kvcache=SimpleNamespace(swa_size=512),
+                    page_size=256,
+                    swa_page_size=256,
+                    c128_attn_allocator=None,
+                ),
+                (2, 1, 2),
+            )
+            estimate.assert_not_called()
 
 
 if __name__ == "__main__":
