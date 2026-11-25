@@ -83,6 +83,9 @@ pub struct RankLoad {
     pub num_reqs: u64,
     /// Uncached tokens waiting for prefill, absent on older publishers.
     pub pending_prefill_tokens: Option<u64>,
+    /// Smoothed measured uncached tokens per busy second; absent until two
+    /// monotonic counter samples. Retained across idle samples, reset on restart.
+    pub prefill_tokens_per_second: Option<u64>,
     /// When the router received the reading.
     pub at: Instant,
 }
@@ -316,6 +319,7 @@ const DEFAULT_FRESHNESS: Duration = Duration::from_secs(5);
 struct LoadEntry {
     load: LoadStat,
     previous_native_cache: Option<NativeCacheRankLoad>,
+    prefill_tokens_per_second: Option<u64>,
     at: Instant,
 }
 
@@ -362,11 +366,38 @@ impl EngineReportedLoadTable {
             .by_rank
             .get(&key)
             .and_then(|entry| entry.load.native_cache.clone());
+        let previous_rate = self
+            .by_rank
+            .get(&key)
+            .and_then(|entry| entry.prefill_tokens_per_second);
+        let prefill_tokens_per_second =
+            match (load.native_cache.as_ref(), previous_native_cache.as_ref()) {
+                (Some(n), Some(p))
+                    if n.total_prefill_uncached_tokens >= p.total_prefill_uncached_tokens
+                        && n.total_prefill_busy_us >= p.total_prefill_busy_us =>
+                {
+                    let tokens = n.total_prefill_uncached_tokens - p.total_prefill_uncached_tokens;
+                    let busy = n.total_prefill_busy_us - p.total_prefill_busy_us;
+                    if tokens > 0 && busy > 0 {
+                        let rate = (u128::from(tokens) * 1_000_000 / u128::from(busy))
+                            .min(u128::from(u64::MAX)) as u64;
+                        (rate > 0).then(|| {
+                            previous_rate.map_or(rate, |old| {
+                                ((u128::from(old) * 7 + u128::from(rate)) / 8) as u64
+                            })
+                        })
+                    } else {
+                        previous_rate
+                    }
+                }
+                _ => None,
+            };
         self.by_rank.insert(
             key,
             LoadEntry {
                 load,
                 previous_native_cache,
+                prefill_tokens_per_second,
                 at,
             },
         );
@@ -610,6 +641,7 @@ impl EngineReportedLoadTable {
                     .native_cache
                     .as_ref()
                     .map(|n| n.num_waiting_uncached_tokens),
+                prefill_tokens_per_second: entry.value().prefill_tokens_per_second,
                 at: *at,
             };
             observed.insert(reading.rank, (reading, fresh));
@@ -673,6 +705,59 @@ mod tests {
             max_total_num_tokens: 0,
             native_cache: None,
         }
+    }
+
+    #[test]
+    fn rank_prefill_rate_survives_idle_samples_but_not_counter_resets() {
+        let t = EngineReportedLoadTable::new();
+        let at = Instant::now();
+        let native = NativeCacheRankLoad {
+            num_waiting_uncached_tokens: 100_000,
+            num_total_tokens: 200_000,
+            max_running_requests: 32,
+            total_prefill_uncached_tokens: 100_000,
+            total_prefill_busy_us: 5_000_000,
+        };
+        let mut load = LoadStat {
+            num_running_reqs: 1,
+            num_waiting_reqs: 10,
+            num_tokens: 100_000,
+            max_total_num_tokens: 1_000_000,
+            native_cache: Some(native),
+        };
+        t.set("w", 0, load.clone(), at);
+        assert_eq!(
+            t.fresh_rank_loads("w", at).unwrap()[0].prefill_tokens_per_second,
+            None
+        );
+        load.native_cache
+            .as_mut()
+            .unwrap()
+            .total_prefill_uncached_tokens += 20_000;
+        load.native_cache.as_mut().unwrap().total_prefill_busy_us += 1_000_000;
+        t.set("w", 0, load.clone(), at);
+        assert_eq!(
+            t.fresh_rank_loads("w", at).unwrap()[0].prefill_tokens_per_second,
+            Some(20_000)
+        );
+        t.set("w", 0, load.clone(), at);
+        assert_eq!(
+            t.fresh_rank_loads("w", at).unwrap()[0].prefill_tokens_per_second,
+            Some(20_000)
+        );
+        load.native_cache
+            .as_mut()
+            .unwrap()
+            .total_prefill_uncached_tokens = 0;
+        load.native_cache.as_mut().unwrap().total_prefill_busy_us = 0;
+        t.set("w", 0, load, at);
+        assert_eq!(
+            t.fresh_rank_loads("w", at).unwrap()[0].prefill_tokens_per_second,
+            None
+        );
+        assert!(t
+            .fresh_rank_loads("w", at + Duration::from_secs(6))
+            .is_none());
     }
 
     #[test]

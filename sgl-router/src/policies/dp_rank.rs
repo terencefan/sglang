@@ -234,6 +234,113 @@ fn prefill_work_rank_impl(
     selected
 }
 
+/// Escape the per-request cache cap only for sustained queue pressure. The
+/// caller still serializes and charges the same worker-wide 10% rolling budget.
+/// Times are scheduling estimates, not GPU timings: extra/min(rate) also prices
+/// the additional work shared by the EP group rather than treating idle attention
+/// ranks as free GPUs. Explicit sticky routes never enter this path.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrefillOverflow {
+    pub rank: u32,
+    pub source_queue_ms: u64,
+    pub predicted_finish_ms: u64,
+    pub extra_tokens: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prefill_overflow_rank(
+    worker: &Worker,
+    cached_rank: u32,
+    normal_rank: u32,
+    prefix_depths: &[(u32, usize)],
+    prompt_tokens: usize,
+    block_size: usize,
+    loads: &[RankLoad],
+    allowance: u64,
+    congested: &[u32],
+    target_ready: impl Fn(u32) -> bool,
+) -> Option<PrefillOverflow> {
+    if !congested.contains(&cached_rank)
+        || block_size == 0
+        || loads.len() != worker.dp_ranks() as usize
+    {
+        return None;
+    }
+    let cached = |rank| {
+        prefix_depths
+            .iter()
+            .filter(|&&(r, _)| r == rank)
+            .map(|&(_, d)| d.saturating_mul(block_size).min(prompt_tokens))
+            .max()
+            .unwrap_or(0) as u64
+    };
+    let reading = |rank| loads.iter().find(|l| l.rank == rank);
+    // Incomplete rates fail closed; idle ranks retain their most recent measured rate.
+    let slowest = loads
+        .iter()
+        .map(|l| l.prefill_tokens_per_second.filter(|&r| r > 0))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .min()?;
+    let millis = |tokens: u64, rate: u64| -> u64 {
+        (u128::from(tokens) * 1000 / u128::from(rate)).min(u128::from(u64::MAX)) as u64
+    };
+    let queue = |l: &RankLoad| -> Option<u64> {
+        let dispatched = worker.dp_rank_dispatched_since(l.rank, l.at) as u64;
+        Some(
+            l.pending_prefill_tokens?
+                .saturating_add(dispatched.saturating_mul(prompt_tokens as u64)),
+        )
+    };
+    let finish = |l: &RankLoad| -> Option<u64> {
+        Some(millis(
+            queue(l)?.saturating_add((prompt_tokens as u64).saturating_sub(cached(l.rank))),
+            l.prefill_tokens_per_second?,
+        ))
+    };
+    let source = reading(cached_rank)?;
+    let source_queue_ms = millis(queue(source)?, source.prefill_tokens_per_second?);
+    if source_queue_ms < 10_000 {
+        return None;
+    }
+    let source_finish = finish(source)?;
+    let normal_finish = finish(reading(normal_rank)?)?;
+    let mut best = None;
+    for l in loads {
+        if l.rank == cached_rank
+            || l.rank >= worker.dp_ranks()
+            || l.num_reqs > 4
+            || worker.dp_rank_dispatched_since(l.rank, l.at) > 0
+            || !target_ready(l.rank)
+        {
+            continue;
+        }
+        let extra = cached(cached_rank).saturating_sub(cached(l.rank));
+        if extra == 0 || extra > allowance || extra > 131_072 {
+            continue;
+        }
+        let predicted_finish_ms = finish(l)?.saturating_add(millis(extra, slowest));
+        // Require both 2x improvement over staying, and >=5s over the normal rule.
+        if predicted_finish_ms.saturating_mul(2) >= source_finish
+            || predicted_finish_ms.saturating_add(5000) >= normal_finish
+        {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|b: &PrefillOverflow| predicted_finish_ms < b.predicted_finish_ms)
+        {
+            best = Some(PrefillOverflow {
+                rank: l.rank,
+                source_queue_ms,
+                predicted_finish_ms,
+                extra_tokens: extra,
+            });
+        }
+    }
+    best
+}
+
 /// `None` for a single-rank worker. `prefix_depths` is `(rank, cached blocks)`;
 /// `preferred` breaks a load tie among the deepest ranks (media affinity's
 /// rendezvous rank, so replicas agree) and never outranks load or depth;
@@ -334,6 +441,7 @@ mod tests {
         let at = Instant::now();
         let loads = [
             RankLoad {
+                prefill_tokens_per_second: None,
                 rank: 0,
                 num_tokens: 0,
                 num_reqs: 1,
@@ -341,6 +449,7 @@ mod tests {
                 at,
             },
             RankLoad {
+                prefill_tokens_per_second: None,
                 rank: 1,
                 num_tokens: 0,
                 num_reqs: 0,
@@ -380,6 +489,7 @@ mod tests {
         let at = Instant::now();
         let mut loads = [
             RankLoad {
+                prefill_tokens_per_second: None,
                 rank: 0,
                 num_tokens: 0,
                 num_reqs: 1,
@@ -387,6 +497,7 @@ mod tests {
                 at,
             },
             RankLoad {
+                prefill_tokens_per_second: None,
                 rank: 1,
                 num_tokens: 0,
                 num_reqs: 1,
@@ -406,6 +517,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sustained_overflow_prices_time_shared_work_and_preserves_total_budget() {
+        let w = worker(3);
+        let at = Instant::now();
+        let cache = [(0, 390)]; // 99,840 cached; cold copy exceeds old per-request cap.
+        let mut loads: Vec<_> = (0..3)
+            .map(|rank| RankLoad {
+                rank,
+                num_tokens: 0,
+                num_reqs: if rank == 0 { 64 } else { 1 },
+                pending_prefill_tokens: Some(if rank == 0 { 1_300_000 } else { 0 }),
+                prefill_tokens_per_second: Some(20_000),
+                at,
+            })
+            .collect();
+        let choose = |loads: &[RankLoad], budget, congested: &[u32]| {
+            prefill_overflow_rank(
+                &w,
+                0,
+                0,
+                &cache,
+                100_000,
+                256,
+                loads,
+                budget,
+                congested,
+                |_| true,
+            )
+        };
+        assert!(choose(&loads, 200_000, &[]).is_none());
+        assert!(choose(&loads, 99_000, &[0]).is_none());
+        let decision = choose(&loads, 100_000, &[0]).unwrap();
+        assert_eq!(decision.rank, 1);
+        assert_eq!(decision.extra_tokens, 99_840);
+        assert_eq!(decision.source_queue_ms, 65_000);
+        assert!(decision.predicted_finish_ms < 10_000);
+        // Missing/reset throughput cannot make a destination appear infinitely fast.
+        loads[2].prefill_tokens_per_second = None;
+        assert!(choose(&loads, 200_000, &[0]).is_none());
+        loads[2].prefill_tokens_per_second = Some(20_000);
+        loads[1].prefill_tokens_per_second = Some(1000);
+        loads[2].prefill_tokens_per_second = Some(1000);
+        assert!(choose(&loads, 200_000, &[0]).is_none());
+        for l in &mut loads {
+            l.prefill_tokens_per_second = Some(20_000);
+        }
+        // A stamped dispatch closes the destination until the next engine reading.
+        let a = w.dp_rank_timestamped_guard(1);
+        let b = w.dp_rank_timestamped_guard(2);
+        assert!(choose(&loads, 200_000, &[0]).is_none());
+        drop((a, b));
+        // Cooldown and the absolute copy bound remain admission constraints.
+        assert!(prefill_overflow_rank(
+            &w,
+            0,
+            0,
+            &cache,
+            100_000,
+            256,
+            &loads,
+            200_000,
+            &[0],
+            |_| false
+        )
+        .is_none());
+        assert!(prefill_overflow_rank(
+            &w,
+            0,
+            0,
+            &[(0, 600)],
+            160_000,
+            256,
+            &loads,
+            200_000,
+            &[0],
+            |_| true
+        )
+        .is_none());
+    }
+
     const LEAST: DpRankPolicy = DpRankPolicy::LeastInFlight;
     const TOKENS: DpRankPolicy = DpRankPolicy::LeastTokens;
 
@@ -414,6 +605,7 @@ mod tests {
         let w = worker(2);
         let at = Instant::now() - Duration::from_millis(1);
         let reading = |rank, pending| RankLoad {
+            prefill_tokens_per_second: None,
             rank,
             num_tokens: 0,
             num_reqs: 0,
@@ -443,6 +635,7 @@ mod tests {
         let at = Instant::now();
         let mut loads = [
             RankLoad {
+                prefill_tokens_per_second: None,
                 rank: 0,
                 num_tokens: 0,
                 num_reqs: 0,
@@ -450,6 +643,7 @@ mod tests {
                 at,
             },
             RankLoad {
+                prefill_tokens_per_second: None,
                 rank: 1,
                 num_tokens: 0,
                 num_reqs: 0,
@@ -476,6 +670,7 @@ mod tests {
         let at = Instant::now();
         let mut loads = [
             RankLoad {
+                prefill_tokens_per_second: None,
                 rank: 0,
                 num_tokens: 0,
                 num_reqs: 10,
@@ -483,6 +678,7 @@ mod tests {
                 at,
             },
             RankLoad {
+                prefill_tokens_per_second: None,
                 rank: 1,
                 num_tokens: 0,
                 num_reqs: 1,
@@ -521,6 +717,7 @@ mod tests {
         let at = Instant::now();
         let loads = [
             RankLoad {
+                prefill_tokens_per_second: None,
                 rank: 0,
                 num_tokens: 0,
                 num_reqs: 20,
@@ -528,6 +725,7 @@ mod tests {
                 at,
             },
             RankLoad {
+                prefill_tokens_per_second: None,
                 rank: 1,
                 num_tokens: 0,
                 num_reqs: 2,
@@ -623,6 +821,7 @@ mod tests {
     fn expected_tokens_charge_every_request_at_the_median_request() {
         let w = worker(2);
         let reading = |rank, num_tokens, num_reqs, at| RankLoad {
+            prefill_tokens_per_second: None,
             rank,
             num_tokens,
             num_reqs,

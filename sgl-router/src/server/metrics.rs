@@ -490,6 +490,7 @@ pub struct MetricsRegistry {
     // extra uncached, reported requests on cold destinations.
     prefill_rank_work: [AtomicU64; 7],
     prefill_guard_events: [AtomicU64; 8],
+    prefill_overflow_events: [AtomicU64; 3],
     pub(crate) prefill_guard_states:
         Mutex<HashMap<(String, String), crate::policies::prefill_guard::PrefillGuard>>,
     // Edge counters (recorded at the app.rs middleware): intake at entry,
@@ -921,6 +922,17 @@ impl MetricsRegistry {
         }
     }
 
+    pub(crate) fn record_prefill_overflow(
+        &self,
+        pressured: bool,
+        overflow: Option<&crate::policies::dp_rank::PrefillOverflow>,
+    ) {
+        self.prefill_overflow_events[0].fetch_add(u64::from(pressured), Ordering::Relaxed);
+        if let Some(o) = overflow {
+            self.prefill_overflow_events[1].fetch_add(1, Ordering::Relaxed);
+            self.prefill_overflow_events[2].fetch_add(o.extra_tokens, Ordering::Relaxed);
+        }
+    }
     pub(crate) fn record_prefill_guard(&self, values: [u64; 8]) {
         for (counter, value) in self.prefill_guard_events.iter().zip(values) {
             counter.fetch_add(value, Ordering::Relaxed);
@@ -1075,6 +1087,18 @@ impl MetricsRegistry {
             "sgl_router_inference_inflight_requests {}\n",
             self.inference_inflight.count()
         ));
+        out.push_str("# HELP sgl_router_prefill_overflow_config_info Estimated queue escape thresholds; per-router accounting.\n# TYPE sgl_router_prefill_overflow_config_info gauge\nsgl_router_prefill_overflow_config_info{queue_seconds=\"10\",sustained_seconds=\"10\",min_requests=\"8\",target_cooldown_seconds=\"2\",max_extra_tokens=\"131072\"} 1\n");
+        for (i, suffix) in [
+            "pressured_decisions_total",
+            "admissions_total",
+            "extra_tokens_total",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let name = format!("sgl_router_prefill_overflow_{suffix}");
+            out.push_str(&format!("# HELP {name} Sustained queue overflow admission; tokens are routing estimates.\n# TYPE {name} counter\n{name} {}\n", self.prefill_overflow_events[i].load(Ordering::Relaxed)));
+        }
         out.push_str("# HELP sgl_router_prefill_guard_config_info Trial recompute admission policy; fractions price estimated extra uncached tokens, not GPU time.\n# TYPE sgl_router_prefill_guard_config_info gauge\nsgl_router_prefill_guard_config_info{per_request_fraction=\"0.25\",window_fraction=\"0.10\",window_seconds=\"60\",residence_seconds=\"60\"} 1\n");
         for (i, name) in [
             "decisions_total",
@@ -1108,12 +1132,12 @@ impl MetricsRegistry {
 
         for (index,(name,help)) in [
             ("decisions_total","Rank-work decisions with prompt tokens and fresh load readings."),
-            ("warm_spills_total","Rank changes within the busy-rank recomputation budget."),
-            ("cold_spills_total","Expensive prefix moves admitted only to idle ranks."),
+            ("warm_spills_total","Rank changes with extra input no larger than baseline plus four pages."),
+            ("cold_spills_total","Expensive prefix moves admitted by sustained queue overflow, within rolling admission credit."),
             ("baseline_uncached_tokens_total","Estimated uncached prompt tokens at the prefix-selected rank."),
             ("selected_uncached_tokens_total","Estimated uncached prompt tokens at the selected rank."),
             ("extra_uncached_tokens_total","Estimated extra prompt tokens introduced by rank migration; not measured engine work."),
-            ("cold_target_requests_total","Engine-reported running/waiting requests at cold migration targets; should stay zero."),
+            ("cold_target_requests_total","Engine-reported requests at expensive migration targets; sustained queue overflow may target lightly loaded ranks."),
         ].into_iter().enumerate() {
             let name=format!("sgl_router_prefill_rank_{name}");
             out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n{name} {}\n",self.prefill_rank_work[index].load(Ordering::Relaxed)));
