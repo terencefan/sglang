@@ -3658,6 +3658,74 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "PD state entry mismatch"):
                 check_state_wire(state_wire(prefill), state_wire(decode))
 
+    def test_dspark_pd_moves_draft_swa_and_mark_to_independent_request_rows(self):
+        # Exercise the production state dispatcher and address planner. Only the
+        # transport is replaced with CPU memmove; this is not an RDMA test.
+        for rank in range(8):
+            with self.subTest(attention_dp_rank=rank):
+                source = [
+                    np.arange(48, dtype=np.int64).reshape(12, 4) + rank * 100,
+                    np.arange(48, dtype=np.int64).reshape(12, 4) + rank * 1000,
+                    np.array([128, 4096 + rank, 8192], dtype=np.int64),
+                ]
+                destination = [
+                    np.full((18, 4), -1, dtype=np.int64),
+                    np.full((18, 4), -1, dtype=np.int64),
+                    np.full(5, -1, dtype=np.int64),
+                ]
+                source_indices = [[1, 2], [3, 4], [1]]
+                destination_indices = [[7, 8], [5, 6], [4]]
+                item_lens = [[32], [32], [8]]
+                manager = object.__new__(MooncakeKVManager)
+                manager.kv_args = SimpleNamespace(
+                    engine_rank=rank, kv_data_ptrs=[],
+                    state_types=[StateType.SWA, StateType.SWA, StateType.REQUEST_ROW],
+                    state_data_ptrs=[[a.ctypes.data] for a in source],
+                    state_item_lens=item_lens,
+                    state_dim_per_tensor=[[], [], []],
+                    state_layer_ids=[[], [], []],
+                )
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = False
+                manager.attn_tp_size = manager.pp_size = 1
+                manager.enable_custom_mem_pool = False
+                manager.max_transfer_batch_indices = 0
+                manager.state_strides_validated = set()
+                manager.request_status = {42: KVPoll.Transferring}
+                writes = []
+
+                def copy_state(_session, blocks):
+                    for src, dst, length in blocks:
+                        writes.append((src, dst, length))
+                        ctypes.memmove(dst, src, length)
+                    return 0
+
+                manager._transfer_data = copy_state
+                req = SimpleNamespace(
+                    room=42, mooncake_session_id="decode",
+                    dst_state_indices=destination_indices,
+                )
+                peer = SimpleNamespace(
+                    dst_attn_tp_size=1,
+                    dst_state_data_ptrs=[[a.ctypes.data] for a in destination],
+                    dst_state_item_lens=item_lens,
+                    dst_state_dim_per_tensor=[[], [], []],
+                    dst_state_layer_ids=[[], [], []],
+                )
+                with get_context().override_server_args(enable_unified_memory=False):
+                    rc = manager.maybe_send_extra(
+                        req, source_indices, None,
+                        target_rank_registration_info=peer,
+                    )
+                self.assertEqual(rc, 0)
+                self.assertEqual(len(writes), 3)
+                for src, dst, src_ids, dst_ids in zip(
+                    source, destination, source_indices, destination_indices
+                ):
+                    expected = np.full_like(dst, -1)
+                    expected[dst_ids] = src[src_ids]
+                    np.testing.assert_array_equal(dst, expected)
+
     def test_draft_state_is_a_separate_component(self):
         mapping = torch.arange(16)
         cases = [
