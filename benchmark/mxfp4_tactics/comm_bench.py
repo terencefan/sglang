@@ -193,6 +193,40 @@ def main():
             comm.reduce_scatter(out, x, sizes=sizes)
         torch.cuda.synchronize()
         assert bool((out == 36).all())
+    if car is not None and not car.disabled:
+        inputs = [
+            torch.full(
+                (192, 5120),
+                float(rank + 1) * scale,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            for scale in [1, 10]
+        ]
+        graphs = []
+        outputs = []
+        for data in inputs:
+            with car.capture():
+                with torch.cuda.graph(graph := torch.cuda.CUDAGraph()):
+                    result = car.custom_all_reduce(data)
+            graphs.append(graph)
+            outputs.append(result)
+        dist.barrier()
+        graphs[rank % 2].replay()
+        torch.cuda.synchronize()
+        selected = outputs[rank % 2]
+        mixed = dict(
+            rank=rank,
+            custom_class=type(car).__name__,
+            graph_choice=rank % 2,
+            expected=216.0,
+            exact=bool((selected == 216).all()),
+            min=float(selected.min().item()),
+            max=float(selected.max().item()),
+        )
+        (a.out / f"mixed-graph-rank{rank}.json").write_text(json.dumps(mixed, indent=2))
+        print(json.dumps({"mixed_graph_contract": mixed}), flush=True)
+    dist.barrier()
     if car is not None:
         car.close()
     dist.barrier()
