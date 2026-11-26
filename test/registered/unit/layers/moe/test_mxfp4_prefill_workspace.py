@@ -250,6 +250,23 @@ class StartupTests(unittest.TestCase):
             [c[0] for c in self.backend.calls], ["size", "size", "allocate"]
         )
 
+    def test_tail_runner_is_guarded_and_included_in_capacity(self):
+        modules = self.setup_modules()
+        layers = list(self.runner.model.modules())
+        tail = SimpleNamespace(runner=SimpleNamespace(max_rows=16384))
+        layers.append(SimpleNamespace(decoder_replay_tail=tail))
+        self.runner.model.modules = lambda: iter(layers)
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(m, "_TorchBackend", return_value=self.backend),
+        ):
+            m.initialize_prefill_workspace(self.runner)
+        self.assertTrue(all(args[0] == 131072 for args, _ in self.size_calls))
+        self.assertEqual(
+            tail.runner.execution_scope,
+            self.runner.mxfp4_prefill_workspace.execution_scope,
+        )
+
     def test_decode_and_draft_are_not_changed(self):
         for role, draft in [("decode", False), ("prefill", True)]:
             modules = self.setup_modules(role=role, draft=draft)
