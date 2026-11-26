@@ -376,7 +376,9 @@ async fn dispatch<T: Transport>(
     let wait_for_prefill = ctx.config.proxy.stream_after_prefill || request.merges_input_logprobs;
     let dispatch = async {
         match prefill_task {
-            Some((task, prefill)) => forward_pd(task, prefill, response, wait_for_prefill).await,
+            Some((task, prefill)) => {
+                forward_pd(task, prefill, response, wait_for_prefill, T::status).await
+            }
             None => (response.await, None, None),
         }
     };
@@ -1106,6 +1108,7 @@ async fn forward_pd<R>(
     prefill: Arc<Worker>,
     decode: impl Future<Output = Result<R, ApiError>>,
     wait_for_prefill: bool,
+    response_status: impl Fn(&R) -> u16,
 ) -> (Result<R, ApiError>, Option<Blame>, Option<Bytes>) {
     // Set on decode's first poll, which is where `forward_to_response_worker`
     // begins and the request reaches the worker. Read from the same task, so
@@ -1136,6 +1139,17 @@ async fn forward_pd<R>(
             },
             // Dropping the handle leaves prefill running.
             response = &mut decode, if held.is_none() => {
+                let decode_failed = match &response {
+                    Err(_) => true,
+                    Ok(response) => !(200..300).contains(&response_status(response)),
+                };
+                if decode_failed {
+                    // No decode consumer can register KV indices. Waiting for prefill
+                    // here only turns a transport/HTTP failure into a bootstrap timeout.
+                    // Aborting drops its proxy guard, which cancels the orphaned rid.
+                    task.abort();
+                    return (response, None, None);
+                }
                 if !wait_for_prefill {
                     return (response, None, None);
                 }
@@ -1370,10 +1384,64 @@ mod tests {
             });
             let decode = async { Ok(Response::new(Body::empty())) };
             let (response, blame, body) =
-                forward_pd(task, Arc::clone(&prefill), decode, wait).await;
+                forward_pd(task, Arc::clone(&prefill), decode, wait, |r| {
+                    r.status().as_u16()
+                })
+                .await;
             assert!(response.is_ok() && blame.is_none());
             assert_eq!(done.load(Ordering::SeqCst), wait);
             assert_eq!(body, wait.then(|| Bytes::from_static(b"p")));
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_failure_does_not_wait_for_prefill_and_drops_its_task() {
+        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                drop(self.0.take());
+            }
+        }
+        for status in [0, 400, 429, 500, 503] {
+            let prefill = Arc::new(Worker::new(crate::discovery::WorkerSpec {
+                mode: WorkerMode::Prefill,
+                ..Default::default()
+            }));
+            let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                let _guard = Dropped(Some(sender));
+                std::future::pending::<PrefillOutcome<Response<Body>>>().await
+            });
+            let decode = async move {
+                if status == 0 {
+                    Err(ApiError::UpstreamTimeout {
+                        worker: "http://decode".parse().unwrap(),
+                    })
+                } else {
+                    Ok(Response::builder()
+                        .status(status)
+                        .body(Body::empty())
+                        .unwrap())
+                }
+            };
+            let (response, blame, body) = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                forward_pd(task, prefill, decode, true, |r| r.status().as_u16()),
+            )
+            .await
+            .expect("decode failure must not wait for prefill bootstrap");
+            assert!(blame.is_none() && body.is_none());
+            if status == 0 {
+                assert!(response.is_err());
+            } else {
+                assert_eq!(response.unwrap().status().as_u16(), status);
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), receiver)
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
         }
     }
 

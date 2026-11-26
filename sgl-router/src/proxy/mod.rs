@@ -421,6 +421,7 @@ impl Proxy {
         {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
+                tracing::warn!(worker = %worker_url, path, error = ?e, "upstream request failed before response headers");
                 breaker.record_failure();
                 return Err(Self::classify_reqwest_error_for(worker_url, e, path));
             }
