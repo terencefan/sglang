@@ -2910,8 +2910,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # below then drops the chunk, including on an abort during it.
                 if kv_chunk.wait_event is not None:
                     if (
-                        kv_chunk.room in self.request_status
-                        and self.check_status(kv_chunk.room) != KVPoll.Failed
+                        self.request_status.get(kv_chunk.room, KVPoll.Failed)
+                        != KVPoll.Failed
                     ):
                         kv_chunk.wait_event.synchronize()
                     kv_chunk.wait_event = None
@@ -2922,8 +2922,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
 
                 if (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Failed
+                    self.request_status.get(kv_chunk.room, KVPoll.Failed)
+                    == KVPoll.Failed
                 ):
                     logger.debug(
                         f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
@@ -3270,16 +3270,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # chunk. A non-last Failed chunk keeps the room (more chunks may
                 # follow), not on the last chunk alone since an earlier deferred
                 # chunk may still need to transfer.
+                # The scheduler may clear the room after seeing Success while
+                # this worker is finishing its bookkeeping. Read status once:
+                # a membership test followed by check_status can race clear().
+                status = self.request_status.get(kv_chunk.room)
                 if self._staging_outstanding.get(kv_chunk.room, 0) <= 0 and (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Success
-                    or (
-                        kv_chunk.is_last_chunk
-                        and self.check_status(kv_chunk.room) == KVPoll.Failed
-                    )
+                    status is None
+                    or status == KVPoll.Success
+                    or (kv_chunk.is_last_chunk and status == KVPoll.Failed)
                 ):
-                    if kv_chunk.room in self.transfer_infos:
-                        self.transfer_infos.pop(kv_chunk.room)
+                    self.transfer_infos.pop(kv_chunk.room, None)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
                     if self.enable_staging:
                         # Purge prefetch bookkeeping for the finished room.
