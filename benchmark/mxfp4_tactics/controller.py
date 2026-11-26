@@ -1,6 +1,7 @@
 """Bounded, one-shot maintenance job; restore verified boot before GPU work."""
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -154,6 +155,11 @@ def main():
     a = p.parse_args()
     root = a.root.resolve()
     plan = json.loads((root / "plan.json").read_text())
+    # Share the serving launcher's lock: an automatic retry must not start
+    # model workers while these eight devices are running experiments.
+    serving_lock = (Path(plan["boot_path"]).parent / "launcher.lock").open("a")
+    fcntl.flock(serving_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    # Python opens this FD close-on-exec; serving can reacquire it after exec.
     # Restore before testing, so any later container restart serves baseline.
     restore_boot(root, plan)
     if not (root / "CLAIMED").exists():
@@ -164,7 +170,10 @@ def main():
             atomic_json(root / "failure.json", {"error": str(exc), "at": time.time()})
             (root / "_FAILED").write_text(str(time.time()))
     atomic_json(root / "state.json", {"phase": "restoring-serving", "at": time.time()})
-    os.execv(sys.executable, [sys.executable, "-B", "-u", plan["boot_path"]])
+    try:
+        os.execv(sys.executable, [sys.executable, "-B", "-u", plan["boot_path"]])
+    finally:
+        serving_lock.close()
 
 
 if __name__ == "__main__":
