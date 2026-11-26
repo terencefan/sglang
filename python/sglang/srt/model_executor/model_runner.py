@@ -795,6 +795,9 @@ class ModelRunner:
         )
 
         initialize_prefill_workspace(self)
+        from sglang.srt.layers.moe.moe_runner.mxfp4_tactics import load_prefill_tactics
+
+        load_prefill_tactics(self)
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(

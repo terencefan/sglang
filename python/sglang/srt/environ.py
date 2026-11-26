@@ -1398,6 +1398,9 @@ class Envs:
     # allocated before KV sizing; Decode and draft runners keep their old path.
     SGLANG_FLASHINFER_MXFP4_PREFILL_PREALLOC_WORKSPACE = EnvBool(False)
     SGLANG_FLASHINFER_MXFP4_PREFILL_TUNE_MAX_TOKENS = EnvInt(8192)
+    SGLANG_REDUCE_SCATTERV_EQUAL_SIZE_FASTPATH = EnvBool(False)
+    SGLANG_FLASHINFER_MXFP4_PREFILL_TACTICS_PATH = EnvStr("")
+    SGLANG_FLASHINFER_MXFP4_PREFILL_TACTICS_SHA256 = EnvStr("")
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
     # sizes it from the per-rank prefill chunk, with a 4096 floor.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)

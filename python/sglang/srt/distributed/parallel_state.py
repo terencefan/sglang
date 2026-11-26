@@ -1321,6 +1321,14 @@ class GroupCoordinator:
             else:
                 assert output.shape == output_shape
 
+            # Opt-in native collective for equal shards only. The deterministic
+            # path above and the grouped per-root Reduce for unequal shards stay.
+            if (
+                envs.SGLANG_REDUCE_SCATTERV_EQUAL_SIZE_FASTPATH.get()
+                and sizes is not None
+                and all(size == sizes[0] for size in sizes)
+            ):
+                sizes = None
             pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
             return output
 
