@@ -8,6 +8,7 @@ small quant_info payload and route through ``MoeRunner``.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -38,6 +39,7 @@ from sglang.srt.utils.device import is_sm120
 from sglang.srt.utils.triton_utils import next_power_of_2
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner.mxfp4_workspace import WorkspaceBinding
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
         FlashinferDispatchOutput,
@@ -153,6 +155,7 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     # GPT-OSS pads its input hidden dim up to the (pre-padded) loaded weight
     # width and trims the output back. DSv4 leaves this as ``None`` (no pad).
     padded_hidden: Optional[int] = None
+    prefill_workspace: WorkspaceBinding | None = None
 
 
 def _flashinfer_cutlass_fused_moe():
@@ -172,14 +175,18 @@ _FLASHINFER_DEFAULT_TUNE_MAX_NUM_TOKENS = 8192
 
 # Tune range: the DP-gathered prefill chunk, capped at FlashInfer's default;
 # PD decode servers run no prefill, so they size it per call.
-def _cutlass_moe_tune_max_num_tokens(num_tokens: int) -> int:
+def _cutlass_moe_tune_max_num_tokens(num_tokens: int, *, mxfp4: bool = False) -> int:
     if get_disagg().disaggregation_mode == "decode":
         return next_power_of_2(num_tokens)
     prefill_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
-    return min(
-        prefill_tokens * deployment_attn_dp_size(),
-        _FLASHINFER_DEFAULT_TUNE_MAX_NUM_TOKENS,
-    )
+    tune_limit = _FLASHINFER_DEFAULT_TUNE_MAX_NUM_TOKENS
+    if mxfp4 and get_disagg().disaggregation_mode == "prefill":
+        tune_limit = envs.SGLANG_FLASHINFER_MXFP4_PREFILL_TUNE_MAX_TOKENS.get()
+        if tune_limit not in (8192, 32768, 65536):
+            raise ValueError(
+                "MXFP4 Prefill tune max tokens must be 8192, 32768 or 65536"
+            )
+    return min(prefill_tokens * deployment_attn_dp_size(), tune_limit)
 
 
 def _activation_type(runner_config: MoeRunnerConfig):
@@ -583,36 +590,45 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
     ):
         out = torch.empty(x.shape[0], out_hidden, dtype=output_dtype, device=x.device)
 
-    flashinfer_cutlass_fused_moe(
-        input=x,
-        token_selected_experts=topk_ids.to(torch.int32),
-        token_final_scales=topk_weights,
-        fc1_expert_weights=fc1_expert_weights,
-        fc2_expert_weights=fc2_expert_weights,
-        output_dtype=output_dtype,
-        quant_scales=quant_scales,
-        input_sf=input_sf,
-        fc1_expert_biases=quant_info.w13_bias,
-        fc2_expert_biases=quant_info.w2_bias,
-        swiglu_alpha=quant_info.swiglu_alpha,
-        swiglu_beta=quant_info.swiglu_beta,
-        swiglu_limit=quant_info.swiglu_limit,
-        tp_size=runner_config.moe_tp_size,
-        tp_rank=runner_config.moe_tp_rank,
-        ep_size=runner_config.moe_ep_size,
-        ep_rank=runner_config.moe_ep_rank,
-        use_w4_group_scaling=not use_mxfp8_act_scaling,
-        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-        activation_type=(
-            ActivationType.SwigluStep
-            if quant_info.use_swiglu_step
-            else ActivationType.Swiglu
-        ),
-        tune_max_num_tokens=_cutlass_moe_tune_max_num_tokens(x.shape[0]),
-        output=out,
-        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
-        **humming_kwargs,
-    )
+    binding = quant_info.prefill_workspace
+    workspace_scope = binding.use(x) if binding is not None else nullcontext(None)
+    with workspace_scope as workspace:
+        workspace_kwargs = (
+            {"workspace_buffer": workspace} if workspace is not None else {}
+        )
+        flashinfer_cutlass_fused_moe(
+            input=x,
+            token_selected_experts=topk_ids.to(torch.int32),
+            token_final_scales=topk_weights,
+            fc1_expert_weights=fc1_expert_weights,
+            fc2_expert_weights=fc2_expert_weights,
+            output_dtype=output_dtype,
+            quant_scales=quant_scales,
+            input_sf=input_sf,
+            fc1_expert_biases=quant_info.w13_bias,
+            fc2_expert_biases=quant_info.w2_bias,
+            swiglu_alpha=quant_info.swiglu_alpha,
+            swiglu_beta=quant_info.swiglu_beta,
+            swiglu_limit=quant_info.swiglu_limit,
+            tp_size=runner_config.moe_tp_size,
+            tp_rank=runner_config.moe_tp_rank,
+            ep_size=runner_config.moe_ep_size,
+            ep_rank=runner_config.moe_ep_rank,
+            use_w4_group_scaling=not use_mxfp8_act_scaling,
+            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+            activation_type=(
+                ActivationType.SwigluStep
+                if quant_info.use_swiglu_step
+                else ActivationType.Swiglu
+            ),
+            tune_max_num_tokens=_cutlass_moe_tune_max_num_tokens(
+                x.shape[0], mxfp4=True
+            ),
+            output=out,
+            use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+            **humming_kwargs,
+            **workspace_kwargs,
+        )
 
     if do_pad:
         out = out[:, :origin_hidden].contiguous()
