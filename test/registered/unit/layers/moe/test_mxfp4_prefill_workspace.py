@@ -336,7 +336,7 @@ class ForwardAdapterTests(unittest.TestCase):
             "envs": SimpleNamespace(
                 SGLANG_FLASHINFER_MOE_FUSED_FINALIZE=SimpleNamespace(get=lambda: True)
             ),
-            "_cutlass_moe_tune_max_num_tokens": lambda n: 8192,
+            "_cutlass_moe_tune_max_num_tokens": lambda n, **kwargs: 8192,
             "nullcontext": nullcontext,
         }
         exec(compile(ast.fix_missing_locations(code), str(source), "exec"), namespace)

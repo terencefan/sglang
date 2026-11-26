@@ -1397,6 +1397,7 @@ class Envs:
     # Eager SM90 W4A16 Prefill only. Share bounded MXFP4 scratch across layers,
     # allocated before KV sizing; Decode and draft runners keep their old path.
     SGLANG_FLASHINFER_MXFP4_PREFILL_PREALLOC_WORKSPACE = EnvBool(False)
+    SGLANG_FLASHINFER_MXFP4_PREFILL_TUNE_MAX_TOKENS = EnvInt(8192)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
     # sizes it from the per-rank prefill chunk, with a 4096 floor.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
