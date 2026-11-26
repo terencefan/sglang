@@ -15,6 +15,7 @@ def main():
     p.add_argument("--root", type=Path, required=True)
     p.add_argument("--gpu", required=True)
     p.add_argument("--cap", type=int, choices=[8192, 32768, 65536], required=True)
+    p.add_argument("--no-fused-finalize", action="store_true")
     a = p.parse_args()
     manifest = json.loads((a.root / "devices.json").read_text())
     assert a.gpu in manifest["gpu_uuids"] and len(manifest["gpu_uuids"]) == 8
@@ -82,7 +83,7 @@ def main():
         ep_rank=0,
         use_w4_group_scaling=True,
         activation_type=ActivationType.Swiglu,
-        use_fused_finalize=True,
+        use_fused_finalize=not a.no_fused_finalize,
         tune_max_num_tokens=a.cap,
         swiglu_limit=torch.full((e,), 10.0, dtype=torch.float32, device=device),
     )
@@ -99,7 +100,7 @@ def main():
         ep_size=ep,
         use_w4_group_scaling=True,
         activation_type=ActivationType.Swiglu,
-        use_fused_finalize=True,
+        use_fused_finalize=not a.no_fused_finalize,
         device=device,
     )
     scratch = torch.empty(size, dtype=torch.uint8, device=device)
@@ -180,6 +181,7 @@ def main():
                     dict(
                         gpu=a.gpu,
                         cap=a.cap,
+                        fused_finalize=not a.no_fused_finalize,
                         workspace_bytes=size,
                         scope="synthetic uniform/skew EP shard; NOT real-request or distributed acceptance",
                         records=records,

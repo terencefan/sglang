@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 
 
-def validate_cache(path, expected_sha256):
+def validate_cache(path, expected_sha256, *, fused_finalize=False):
     path = Path(path)
     if not path.is_absolute() or path.is_symlink() or not path.is_file():
         raise ValueError("MXFP4 tactic cache must be an absolute regular file")
@@ -54,7 +54,7 @@ def validate_cache(path, expected_sha256):
                 True,
                 3,
                 False,
-                True,
+                fused_finalize,
             )
             or value[0] != "MoERunner"
             or not isinstance(value[1], int)
@@ -81,7 +81,9 @@ def load_prefill_tactics(model_runner):
     if get_disagg().disaggregation_mode != "prefill":
         raise ValueError("MXFP4 Prefill tactic replay requires Prefill role")
     path, count = validate_cache(
-        path, envs.SGLANG_FLASHINFER_MXFP4_PREFILL_TACTICS_SHA256.get()
+        path,
+        envs.SGLANG_FLASHINFER_MXFP4_PREFILL_TACTICS_SHA256.get(),
+        fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
     )
     from flashinfer.autotuner import AutoTuner
 

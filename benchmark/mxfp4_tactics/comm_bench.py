@@ -20,6 +20,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--with-custom", action="store_true")
+    p.add_argument("--custom-runtime", action="store_true")
     a = p.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     rank = int(os.environ["LOCAL_RANK"])
@@ -38,7 +39,14 @@ def main():
         with get_parallel().override(
             world_group=SimpleNamespace(local_rank=rank, barrier=lambda: dist.barrier())
         ):
-            car = CustomAllreduce(dist.group.WORLD, device=device)
+            cls = CustomAllreduce
+            if a.custom_runtime:
+                from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                    dispatch_custom_allreduce,
+                )
+
+                cls = dispatch_custom_allreduce(dist.group.WORLD, device=device)
+            car = cls(dist.group.WORLD, device=device)
     records = []
 
     def measure(fn):
@@ -59,7 +67,7 @@ def main():
             times.append(first.elapsed_time(last))
         return statistics.median(times)
 
-    for n in [128, 192, 224, 240, 256, 512, 1024, 4096, 8192]:
+    for n in [8, 16, 32, 64, 128, 192, 224, 240, 256, 512, 1024, 4096, 8192]:
         x = torch.full(
             (n * 8, 5120), float(rank + 1), dtype=torch.bfloat16, device=device
         )
@@ -125,6 +133,7 @@ def main():
             "native_ms": ms_new,
             "graph_baseline_ms": graph_old,
             "graph_native_ms": graph_new,
+            "custom_class": type(car).__name__ if car is not None else None,
             "custom_ar_eligible": bool(custom_supported) if car is not None else None,
             "allreduce_bytes": ar_input.numel() * ar_input.element_size(),
         }
@@ -140,6 +149,32 @@ def main():
             row["custom_allreduce_ms"] = measure(
                 lambda: car.custom_all_reduce(ar_input)
             )
+            with car.capture():
+                with torch.cuda.graph(ga := torch.cuda.CUDAGraph()):
+                    custom_out = car.custom_all_reduce(ar_input)
+            with comm.change_state(enable=True):
+                with torch.cuda.graph(gn := torch.cuda.CUDAGraph()):
+                    comm.outplace_all_reduce(ar_input, other)
+            ga.replay()
+            gn.replay()
+            torch.cuda.synchronize()
+            assert custom_out is not None and torch.equal(custom_out, other)
+            row["custom_graph_ms"] = measure(ga.replay)
+            row["nccl_ar_graph_ms"] = measure(gn.replay)
+            torch.manual_seed(20261127 + rank)
+            ar_input.normal_()
+            ga.replay()
+            gn.replay()
+            torch.cuda.synchronize()
+            row["custom_random_exact"] = torch.equal(custom_out, other)
+            row["custom_random_max_abs"] = (
+                (custom_out.float() - other.float()).abs().max().item()
+            )
+            row["custom_random_tolerance"] = bool(
+                torch.allclose(custom_out, other, rtol=0.01, atol=0.01)
+            )
+            del ga, gn, custom_out
+
         records.append(row)
         (a.out / f"rank{rank}.json").write_text(json.dumps(records, indent=2))
         print(json.dumps({"rank": rank, **row}), flush=True)

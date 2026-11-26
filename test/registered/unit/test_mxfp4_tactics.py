@@ -15,7 +15,7 @@ spec.loader.exec_module(module)
 
 
 def cache_file(tmp_path):
-    extras = "(torch.bfloat16, torch.uint8, torch.bfloat16, 6, 1, 8, 1, False, False, True, False, False, False, True, 3, False, True)"
+    extras = "(torch.bfloat16, torch.uint8, torch.bfloat16, 6, 1, 8, 1, False, False, True, False, False, False, True, 3, False, False)"
     d = {"_metadata": {"flashinfer_version": "0.7.4", "gpu": "NVIDIA H200"}}
     for stage in [1, 2]:
         key = f"('trtllm::fused_moe::gemm{stage}', 'MoERunner', ((8192, 5120), (48, 4608, 2560), (0,), (48, 5120, 1152), (0,)), {extras})"
@@ -67,3 +67,9 @@ def test_symlink_rejected(tmp_path):
     link.symlink_to(p)
     with pytest.raises(ValueError, match="regular"):
         module.validate_cache(link, sha(p))
+
+
+def test_finalize_mode_must_match_runtime(tmp_path):
+    p = cache_file(tmp_path)
+    with pytest.raises(ValueError, match="unvalidated"):
+        module.validate_cache(p, sha(p), fused_finalize=True)
