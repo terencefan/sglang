@@ -193,6 +193,12 @@ def main():
             comm.reduce_scatter(out, x, sizes=sizes)
         torch.cuda.synchronize()
         assert bool((out == 36).all())
+        if all(size == sizes[0] for size in sizes):
+            native_empty = torch.empty_like(out)
+            with comm.change_state(enable=True):
+                comm.reduce_scatter(native_empty, x, sizes=None)
+            torch.cuda.synchronize()
+            assert torch.equal(out, native_empty)
     if car is not None and not car.disabled:
         inputs = [
             torch.full(
