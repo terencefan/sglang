@@ -16,6 +16,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--root", type=Path, required=True)
     a = p.parse_args()
+    # Synthetic kernel validation needs only a small host submission/JIT pool.
+    os.environ.setdefault("MAX_JOBS", "2")
+    os.environ.setdefault("OMP_NUM_THREADS", "2")
     out = a.root / "output"
     out.mkdir(exist_ok=False)
     stop = threading.Event()

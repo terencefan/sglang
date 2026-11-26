@@ -13,6 +13,7 @@ def main():
     p.add_argument("--root", type=Path, required=True)
     p.add_argument("--name", required=True)
     p.add_argument("--apply", action="store_true")
+    p.add_argument("--cpu", type=int, choices=[2, 4, 8], default=8)
     a = p.parse_args()
     if not a.root.is_absolute() or not all(
         (a.root / name).is_file()
@@ -33,7 +34,7 @@ def main():
         "--replicas",
         "1",
         "--cpu",
-        "8",
+        str(a.cpu),
         "--memory",
         "32768",
         "--gpu",
