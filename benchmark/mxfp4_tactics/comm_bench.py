@@ -181,6 +181,7 @@ def main():
         del g1, g2, x, baseline, native
     # Unequal and empty shards retain the variable-size implementation.
     for sizes in [
+        [0] * 8,
         [0, 6, 12, 0, 18, 24, 30, 36],
         [180, 192, 198, 210, 216, 222, 228, 234],
     ]:
