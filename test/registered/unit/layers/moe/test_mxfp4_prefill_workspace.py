@@ -92,10 +92,44 @@ class ArenaTests(unittest.TestCase):
 
     def test_capture_rejected_without_growth(self):
         self.backend.capture = True
-        with self.assertRaisesRegex(RuntimeError, "eager-only"):
+        with self.assertRaisesRegex(RuntimeError, "guarded runner"):
             with self.arena.use(8):
                 self.fail("capture reached kernel")
         self.assertEqual(len(self.backend.calls), 1)
+
+    def test_guarded_capture_and_replay_stream_handoff(self):
+        with self.arena.execution_scope():
+            self.backend.stream_id = 2
+            with self.arena.use(8):  # capture warmup
+                pass
+            before = list(self.backend.calls)
+            self.backend.capture = True
+            with self.arena.use(8):
+                pass
+            self.assertEqual(before, self.backend.calls)
+            self.backend.capture = False
+            self.backend.stream_id = 1
+            with self.arena.execution_scope():  # replay skips use()
+                self.assertEqual(
+                    self.backend.calls[-3:],
+                    [("event_record", 2), ("wait", 1), ("record_stream", 1)],
+                )
+        self.assertIsNone(m._active_graph_workspace.get())
+
+    def test_capture_on_unprepared_stream_rejected(self):
+        with self.arena.execution_scope():
+            self.backend.stream_id = 2
+            self.backend.capture = True
+            with self.assertRaisesRegex(RuntimeError, "guarded runner"):
+                with self.arena.use(8):
+                    pass
+        self.assertIsNone(m._active_graph_workspace.get())
+
+    def test_execution_scope_exception_resets_owner(self):
+        with self.assertRaisesRegex(RuntimeError, "kernel"):
+            with self.arena.execution_scope():
+                raise RuntimeError("kernel")
+        self.assertIsNone(m._active_graph_workspace.get())
 
     def test_dtype_device_guard(self):
         binding = m.WorkspaceBinding(self.arena, "bf16", 5120)

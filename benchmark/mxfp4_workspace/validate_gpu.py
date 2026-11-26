@@ -176,6 +176,30 @@ def main():
             torch.cuda.synchronize()
             for out in outputs:
                 torch.testing.assert_close(out, reference, rtol=0, atol=0)
+        if n == 128:
+            graph = torch.cuda.CUDAGraph()
+            capture_stream = torch.cuda.Stream()
+            graph_out = torch.empty_like(x)
+            with arena.execution_scope():
+                with torch.cuda.stream(capture_stream):
+                    for _ in range(2):
+                        with arena.use(n) as scratch:
+                            cutlass_fused_moe(
+                                **call, output=graph_out, workspace_buffer=scratch
+                            )
+                torch.cuda.synchronize()
+                with torch.cuda.graph(graph, stream=capture_stream):
+                    with arena.use(n) as scratch:
+                        cutlass_fused_moe(
+                            **call, output=graph_out, workspace_buffer=scratch
+                        )
+                # Replay does not call arena.use: every caller must guard it.
+                for stream in streams * 3:
+                    with torch.cuda.stream(stream), arena.execution_scope():
+                        graph.replay()
+                    stream.synchronize()
+                    torch.testing.assert_close(graph_out, reference, rtol=0, atol=0)
+            assert arena.buffer.data_ptr() == before_ptr
         del x, ids, probabilities, reference, actual, call
     if max(x["peak_extra_bytes"] for x in results) > 128 * 1024**2:
         raise RuntimeError("unexpected runtime scratch growth; inspect allocator trace")
@@ -186,6 +210,7 @@ def main():
                 "workspace_bytes": size,
                 "results": results,
                 "two_stream_exact_equal": True,
+                "graph_capture_and_cross_stream_replay_exact_equal": True,
                 "limits": "synthetic EP shard on one GPU; not distributed serving or sustained-load acceptance",
             },
             indent=2,

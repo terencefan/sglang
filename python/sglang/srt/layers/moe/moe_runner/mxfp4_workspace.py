@@ -1,12 +1,15 @@
-"""Model-owned, bounded scratch for eager SM90 MXFP4 Prefill.
+"""Model-owned, bounded scratch for SM90 MXFP4 Prefill.
 
 No process-global tensor cache: all layers of one target runner share one arena.
 Allocate before KV sizing. Never grow or silently fall back on the hot path.
 """
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from threading import Lock
+from threading import RLock
+
+_active_graph_workspace = ContextVar("active_mxfp4_graph_workspace", default=None)
 
 
 class _TorchBackend:
@@ -33,7 +36,8 @@ class PrefillWorkspace:
 
     Same-stream layers need no event operations. On a stream change, record
     completion on the previous stream, then enqueue a wait on the next one.
-    Capture is rejected: this opt-in path intentionally supports eager only.
+    Graph capture and replay must both hold execution_scope. Captured kernels
+    use the same stable pointer; replay must establish stream ownership again.
     """
 
     def __init__(self, size_bytes, max_rows, device, *, backend=None):
@@ -46,7 +50,30 @@ class PrefillWorkspace:
         self.buffer = self.backend.allocate(size_bytes, device)
         self._completion = self.backend.event()
         self._previous_stream = None
-        self._lock = Lock()
+        self._lock = RLock()
+
+    def _handoff(self, stream):
+        previous = self._previous_stream
+        if previous is not None and previous.cuda_stream != stream.cuda_stream:
+            self._completion.record(previous)
+            stream.wait_event(self._completion)
+        self.buffer.record_stream(stream)
+        self._previous_stream = stream
+
+    @contextmanager
+    def execution_scope(self):
+        """Serialize a graph invocation, including replays that skip Python use()."""
+        with self._lock:
+            if self.backend.capturing():
+                raise RuntimeError(
+                    "workspace execution scope must start outside capture"
+                )
+            self._handoff(self.backend.stream(self.device))
+            token = _active_graph_workspace.set(self)
+            try:
+                yield
+            finally:
+                _active_graph_workspace.reset(token)
 
     @contextmanager
     def use(self, rows):
@@ -56,16 +83,20 @@ class PrefillWorkspace:
                 "restart with a sufficient prefill capacity"
             )
         with self._lock:
-            if self.backend.capturing():
-                raise RuntimeError("preallocated MXFP4 Prefill workspace is eager-only")
             stream = self.backend.stream(self.device)
-            previous = self._previous_stream
-            if previous is not None and previous.cuda_stream != stream.cuda_stream:
-                self._completion.record(previous)
-                stream.wait_event(self._completion)
-            self.buffer.record_stream(stream)
-            # Also retain ownership if the caller raises after enqueueing work.
-            self._previous_stream = stream
+            if self.backend.capturing():
+                if (
+                    _active_graph_workspace.get() is not self
+                    or self._previous_stream is None
+                    or self._previous_stream.cuda_stream != stream.cuda_stream
+                ):
+                    raise RuntimeError(
+                        "MXFP4 workspace capture requires a guarded runner"
+                    )
+                # Warmup established ownership on this capture stream. Do not
+                # record events or allocator lifetime operations inside capture.
+            else:
+                self._handoff(stream)
             yield self.buffer
 
 
@@ -87,7 +118,7 @@ class WorkspaceBinding:
 
 
 def initialize_prefill_workspace(model_runner):
-    """Opt in only the current eager, target-only SM90 W4A16 Prefill path."""
+    """Opt in only the target-only SM90 W4A16 Prefill path."""
     from sglang.srt.environ import envs
     from sglang.srt.runtime_context import get_disagg
 
@@ -144,7 +175,15 @@ def initialize_prefill_workspace(model_runner):
 
     if "workspace_buffer" not in inspect.signature(cutlass_fused_moe).parameters:
         raise RuntimeError("FlashInfer must support cutlass_fused_moe workspace_buffer")
-    max_rows = max_prefill_buffer_tokens() * deployment_attn_dp_size()
+    tails = [
+        layer.decoder_replay_tail
+        for layer in model_runner.model.modules()
+        if getattr(layer, "decoder_replay_tail", None) is not None
+    ]
+    max_rows = (
+        max([max_prefill_buffer_tokens()] + [tail.runner.max_rows for tail in tails])
+        * deployment_attn_dp_size()
+    )
     if max_rows <= 0:
         raise ValueError("a bounded prefill buffer capacity is required")
     sizes = {}
@@ -195,6 +234,8 @@ def initialize_prefill_workspace(model_runner):
         method._prefill_workspace = WorkspaceBinding(
             arena, torch.bfloat16, method.moe_runner_config.hidden_size
         )
+    for tail in tails:
+        tail.runner.execution_scope = arena.execution_scope
     # Explicit ownership, introspection, and lifetime of the target runner.
     model_runner.mxfp4_prefill_workspace = arena
     logging.getLogger(__name__).info(

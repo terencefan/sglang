@@ -12,6 +12,7 @@ import copy
 import logging
 import time
 from contextlib import nullcontext
+from functools import wraps
 from typing import TYPE_CHECKING, Callable, ContextManager, List, Optional
 
 import torch
@@ -53,6 +54,15 @@ BatchScope = Callable[["ForwardBatch", List[torch.Tensor]], ContextManager]
 
 def _no_scope(batch: ForwardBatch, inputs: List[torch.Tensor]) -> ContextManager:
     return nullcontext()
+
+
+def _with_execution_scope(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with getattr(self, "execution_scope", nullcontext)():
+            return method(self, *args, **kwargs)
+
+    return guarded
 
 
 def _pack_token_counts(local_rows: int, global_rows: int) -> int:
@@ -111,6 +121,7 @@ class RowBucketGraphRunner:
             return None
         return -(-num_rows // self.row_step) * self.row_step
 
+    @_with_execution_scope
     def run(
         self,
         *,
@@ -192,7 +203,13 @@ class RowBucketGraphRunner:
                 graph.num_token_non_padded.fill_(num_rows)
                 step_batch.num_token_non_padded = graph.num_token_non_padded
             with batch_scope(step_batch, [buf[:rows] for buf in static]):
-                with graph_pool_replay_scope():
+                # Capture warmup may have switched scratch ownership to the
+                # capture stream. Rebind on every actual replay, even when the
+                # graph body never re-enters Python.
+                with (
+                    graph_pool_replay_scope(),
+                    getattr(self, "execution_scope", nullcontext)(),
+                ):
                     graph.graph.replay()
         return [None if t is None else t[:out_rows] for t in graph.outputs]
 
