@@ -11,8 +11,18 @@ from collections import defaultdict
 from enum import IntEnum
 from pathlib import Path
 from queue import SimpleQueue
+from runpy import run_path
 from types import SimpleNamespace
 from unittest.mock import Mock
+
+
+ROOT = Path(__file__).resolve().parents[4]
+# Load the stdlib-only registry directly: this test does not need an installed
+# SGLang package or any Torch/CUDA dependencies.
+register_cpu_ci = run_path(str(ROOT / "python/sglang/test/ci/ci_register.py"))[
+    "register_cpu_ci"
+]
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class Poll(IntEnum):
