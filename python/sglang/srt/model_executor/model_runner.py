@@ -790,6 +790,11 @@ class ModelRunner:
             is_draft=self.is_draft_worker,
         )
         allocate_mega_moe_buffers(self.model)
+        from sglang.srt.layers.moe.moe_runner.mxfp4_workspace import (
+            initialize_prefill_workspace,
+        )
+
+        initialize_prefill_workspace(self)
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(

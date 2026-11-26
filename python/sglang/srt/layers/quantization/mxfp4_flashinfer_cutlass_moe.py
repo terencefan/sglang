@@ -262,5 +262,6 @@ class Mxfp4FlashinferCutlassMoEMethod:
             swiglu_limit=self._swiglu_limit_tensor,
             use_swiglu_step=self._use_swiglu_step,
             padded_hidden=None,
+            prefill_workspace=getattr(self, "_prefill_workspace", None),
         )
         return self.runner.run(dispatch_output, quant_info)

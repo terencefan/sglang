@@ -1394,6 +1394,9 @@ class Envs:
     SGLANG_FLASHINFER_USE_TENSOR_CORE = EnvBool(None)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Eager SM90 W4A16 Prefill only. Share bounded MXFP4 scratch across layers,
+    # allocated before KV sizing; Decode and draft runners keep their old path.
+    SGLANG_FLASHINFER_MXFP4_PREFILL_PREALLOC_WORKSPACE = EnvBool(False)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
     # sizes it from the per-rank prefill chunk, with a 4096 floor.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
