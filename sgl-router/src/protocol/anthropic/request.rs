@@ -175,7 +175,7 @@ pub fn to_chat(req: Value, count_only: bool, inline_system: bool) -> Result<Conv
         chat.insert("response_format".into(), convert_format(format)?);
     }
 
-    let tools = match req.get("tools").filter(|v| !v.is_null()) {
+    let mut tools = match req.get("tools").filter(|v| !v.is_null()) {
         Some(t) => convert_tools(t)?,
         None => Vec::new(),
     };
@@ -187,6 +187,9 @@ pub fn to_chat(req: Value, count_only: bool, inline_system: bool) -> Result<Conv
         if parallel == Some(false) {
             chat.insert("parallel_tool_calls".into(), Value::Bool(false));
         }
+    }
+    if model == "deepseek-flash-1017" {
+        expand_deepseek_references(chat.get_mut("messages").unwrap(), &mut tools)?;
     }
     if !tools.is_empty() {
         chat.insert("tools".into(), Value::Array(tools));
@@ -200,6 +203,42 @@ pub fn to_chat(req: Value, count_only: bool, inline_system: bool) -> Result<Conv
         },
         stream,
     })
+}
+
+/// Resolve deferred references before inference, token counting and cache rendering.
+fn expand_deepseek_references(messages: &mut Value, tools: &mut [Value]) -> Result<(), String> {
+    for (i, message) in messages.as_array_mut().unwrap().iter_mut().enumerate() {
+        if message["role"] != "tool" {
+            continue;
+        }
+        let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for (j, part) in parts.iter_mut().enumerate() {
+            if part["type"] != "tool_reference" {
+                continue;
+            }
+            let name = part["name"]
+                .as_str()
+                .ok_or_else(|| format!("messages.{i}.content.{j}.name: field required"))?;
+            let matches: Vec<usize> = tools
+                .iter()
+                .enumerate()
+                .filter(|(_, tool)| tool["function"]["name"].as_str() == Some(name))
+                .map(|(index, _)| index)
+                .collect();
+            if matches.len() != 1 {
+                return Err(format!(
+                    "messages.{i}.content.{j}: tool reference '{name}' requires exactly one tool definition"
+                ));
+            }
+            let tool = &mut tools[matches[0]];
+            let text = format!("Available tool definition:\n{}", tool["function"]);
+            tool.as_object_mut().unwrap().remove("defer_loading");
+            *part = json!({"type": "text", "text": text});
+        }
+    }
+    Ok(())
 }
 
 fn thinking_enabled(thinking: &Value) -> Result<bool, String> {
@@ -1111,6 +1150,61 @@ mod tests {
         assert_eq!(
             chat(r)["messages"],
             json!([{"role": "user", "content": "q"}])
+        );
+    }
+}
+
+#[cfg(test)]
+mod deepseek_reference_tests {
+    use super::*;
+
+    #[test]
+    fn expands_and_activates_deferred_tool() {
+        let mut messages = json!([{"role":"tool","tool_call_id":"call1","content":[
+            {"type":"tool_reference","name":"Read"},{"type":"text","text":"keep"}
+        ]}]);
+        let mut tools = vec![json!({"type":"function","defer_loading":true,
+            "function":{"name":"Read","description":"Read a file","parameters":{"type":"object"}}})];
+        expand_deepseek_references(&mut messages, &mut tools).unwrap();
+        assert_eq!(messages[0]["tool_call_id"], "call1");
+        assert_eq!(messages[0]["content"][1]["text"], "keep");
+        assert!(messages[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("parameters"));
+        assert!(tools[0].get("defer_loading").is_none());
+    }
+
+    #[test]
+    fn deepseek_conversion_matches_counting_and_preserves_other_models() {
+        let request = json!({"model":"deepseek-flash-1017","max_tokens":1,
+        "tools":[{"name":"Read","input_schema":{"type":"object"},"defer_loading":true}],
+        "messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"ToolSearch","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"c1",
+                "content":[{"type":"tool_reference","tool_name":"Read"}]}]}
+        ]});
+        let chat = to_chat(request.clone(), false, false).unwrap().chat;
+        let count = to_chat(request.clone(), true, false).unwrap().chat;
+        assert_eq!(chat["messages"], count["messages"]);
+        assert_eq!(chat["tools"], count["tools"]);
+        assert!(!chat.to_string().contains("tool_reference"));
+        let mut other = request;
+        other["model"] = json!("other-model");
+        assert!(to_chat(other, false, false)
+            .unwrap()
+            .chat
+            .to_string()
+            .contains("tool_reference"));
+    }
+
+    #[test]
+    fn rejects_unresolved_or_ambiguous_reference() {
+        let messages = json!([{"role":"tool","content":[{"type":"tool_reference","name":"Read"}]}]);
+        assert!(expand_deepseek_references(&mut messages.clone(), &mut []).is_err());
+        let tool = json!({"function":{"name":"Read"}});
+        assert!(
+            expand_deepseek_references(&mut messages.clone(), &mut [tool.clone(), tool]).is_err()
         );
     }
 }
