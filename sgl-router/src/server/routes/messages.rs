@@ -91,7 +91,10 @@ fn parse(
 ) -> Result<anthropic::Converted, ApiError> {
     let req: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| ApiError::BadRequest(format!("request body is not valid JSON: {e}")))?;
-    anthropic::to_chat(req, count_only, inline_system).map_err(ApiError::BadRequest)
+    anthropic::to_chat(req, count_only, inline_system).map_err(|error| {
+        tracing::warn!(error = %error, "messages request conversion rejected");
+        ApiError::BadRequest(error)
+    })
 }
 
 /// `echo` is `Some((echo, streaming))`, `None` on the error paths.
