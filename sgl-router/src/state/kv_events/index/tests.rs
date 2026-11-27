@@ -546,6 +546,7 @@ async fn pump_applies_load_to_engine_load_table() {
     tx.send(WorkerEvent::Load {
         worker: id.clone(),
         load: LoadStat {
+            prefill_cost: None,
             num_running_reqs: 8,
             num_waiting_reqs: 4,
             num_tokens: 0,
@@ -864,6 +865,7 @@ async fn remove_worker_clears_engine_load() {
         url,
         0,
         LoadStat {
+            prefill_cost: None,
             num_running_reqs: 3,
             num_waiting_reqs: 1,
             num_tokens: 0,

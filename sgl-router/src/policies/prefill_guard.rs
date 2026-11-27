@@ -175,6 +175,7 @@ mod tests {
         let t = Instant::now();
         let mut g = PrefillGuard::new(t);
         let mut l = RankLoad {
+            prefill_cost: None,
             rank: 7,
             num_tokens: 0,
             num_reqs: 64,

@@ -319,6 +319,7 @@ async fn decode_dp_rank_policy_is_separate_from_the_prefill_policy() {
     let app = router_with_load(cfg, &workers, Default::default(), Arc::clone(&load));
     for (rank, num_tokens) in [(0, 400), (1, 100), (2, 900), (3, 250)] {
         let stat = LoadStat {
+            prefill_cost: None,
             num_running_reqs: 0,
             num_waiting_reqs: 0,
             num_tokens,
@@ -367,6 +368,7 @@ async fn least_tokens_sends_decode_to_the_rank_expected_to_hold_the_fewest_kv_to
     let app = router_with_load(cfg, &workers, Default::default(), Arc::clone(&load));
     let publish = |rank: u32, num_tokens: u64| {
         let stat = LoadStat {
+            prefill_cost: None,
             num_running_reqs: 0,
             num_waiting_reqs: 0,
             num_tokens,
@@ -413,6 +415,7 @@ async fn least_tokens_charges_in_flight_requests_to_their_rank() {
     // Rank 0 is expected to hold 400 + 100 = 500, rank 1 100 + 100 = 200.
     for (rank, num_tokens, num_reqs) in [(0, 400, 1), (1, 100, 1)] {
         let stat = LoadStat {
+            prefill_cost: None,
             num_running_reqs: num_reqs,
             num_waiting_reqs: 0,
             num_tokens,
@@ -559,5 +562,82 @@ async fn embedding_like_endpoints_leave_the_rank_to_the_engine() {
         assert!(response.status().is_success());
         assert_eq!(worker.captured.lock().unwrap().headers.get(RANK), None);
         assert!(worker.captured_json().await.get("routed_dp_rank").is_none());
+    }
+}
+
+/// Run in a dedicated process: mode is process configuration, not a per-request
+/// override. The ordinary suite leaves this ignored and never changes env.
+#[tokio::test]
+#[ignore = "run with SGLANG_ROUTER_PREFILL_COST_MODE=enforce"]
+async fn cold_cost_route_and_warm_prefix_fallback() {
+    use sgl_router::policies::prefill_cost::PrefillCostSummary;
+    use sgl_router::state::load_monitor::engine_reported_load::NativeCacheRankLoad;
+    assert_eq!(
+        std::env::var("SGLANG_ROUTER_PREFILL_COST_MODE").as_deref(),
+        Ok("enforce")
+    );
+    for warm in [false, true] {
+        let (prefill, decode) = (
+            MockWorker::start(vec![]).await,
+            MockWorker::start(vec![]).await,
+        );
+        let mut cfg = config();
+        cfg.model.dp_aware = true;
+        cfg.model.dp_rank_policy = DpRankPolicy::PrefillWork;
+        let tree = Arc::new(HashTree::new());
+        if warm {
+            let tokenizers = TokenizerRegistry::load_from_config(&cfg).unwrap();
+            let tokens = request_tokens_for(&tokenizers, &ModelId(MODEL.into()), &body()).unwrap();
+            let hashes = compute_block_hashes(&tokens.ids, 1);
+            tree.insert(&KvWorkerId::new(prefill.url.clone(), 0), None, &hashes);
+        }
+        let load = EngineReportedLoadTable::new();
+        for rank in 0..2 {
+            load.set(
+                &prefill.url,
+                rank,
+                LoadStat {
+                    prefill_cost: Some(PrefillCostSummary {
+                        schema: 1,
+                        model: 123,
+                        boot: 1,
+                        sequence: 1,
+                        coefficients_ps: [0, 1000000, 0, 0, 0],
+                        queue_us: if rank == 0 { 500000 } else { 0 },
+                        remaining_us: 0,
+                    }),
+                    num_running_reqs: 0,
+                    num_waiting_reqs: 0,
+                    num_tokens: 0,
+                    max_total_num_tokens: 1000000,
+                    native_cache: Some(NativeCacheRankLoad {
+                        num_waiting_uncached_tokens: if rank == 0 { 0 } else { 1000 },
+                        num_total_tokens: 0,
+                        max_running_requests: 640,
+                        total_prefill_uncached_tokens: 0,
+                        total_prefill_busy_us: 0,
+                    }),
+                },
+                Instant::now(),
+            );
+        }
+        let workers = [
+            (&prefill, WorkerMode::Prefill, 2),
+            (&decode, WorkerMode::Decode, 2),
+        ];
+        let app = router_with_load(cfg, &workers, tree, load);
+        send(&app, &decode, &[]).await;
+        let start = Instant::now();
+        let rank = loop {
+            if let Some(rank) = prefill.captured.lock().unwrap().headers.get(RANK).cloned() {
+                break rank;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "prefill not dispatched"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(rank, if warm { "0" } else { "1" }, "warm={warm}");
     }
 }

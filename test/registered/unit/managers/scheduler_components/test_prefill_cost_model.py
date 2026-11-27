@@ -7,10 +7,13 @@ path = (
     Path(__file__).resolve().parents[5]
     / "python/sglang/srt/managers/scheduler_components/prefill_cost_model.py"
 )
-spec = importlib.util.spec_from_file_location("prefill_cost_model_under_test", path)
-m = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = m
-spec.loader.exec_module(m)
+try:
+    from sglang.srt.managers.scheduler_components import prefill_cost_model as m
+except ModuleNotFoundError:
+    spec = importlib.util.spec_from_file_location("prefill_cost_model_under_test", path)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = m
+    spec.loader.exec_module(m)
 
 
 class CostModelTests(unittest.TestCase):

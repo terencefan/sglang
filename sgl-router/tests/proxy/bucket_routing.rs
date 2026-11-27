@@ -250,6 +250,7 @@ fn set_native_load_with_waiting(
         worker_url,
         0,
         LoadStat {
+            prefill_cost: None,
             num_running_reqs: 0,
             num_waiting_reqs: 0,
             num_tokens: num_total_tokens,

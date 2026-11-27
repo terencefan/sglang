@@ -10,6 +10,7 @@ pub mod factory;
 pub mod load_based;
 pub mod power_of_two;
 pub(crate) mod prefill_guard;
+pub mod prefill_cost;
 pub mod random;
 pub mod registry;
 pub mod round_robin;

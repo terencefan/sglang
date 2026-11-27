@@ -99,3 +99,23 @@ def finish_quote_ms(
     if any(not math.isfinite(x) or x < 0 for x in costs):
         raise ValueError("invalid quote component")
     return sum(costs)
+
+
+def remaining_cost_ms(model, work, chunk=8192):
+    """Sum fixed-chunk costs analytically, without walking every future chunk.
+
+    A per-request upper-style quote: mixed batching can amortize the constant
+    term. Reload costs are intentionally not invented here.
+    """
+    if chunk <= 0:
+        raise ValueError("positive quote chunk required")
+    full, tail = divmod(work.rows, chunk)
+    c0, c1, c2, c3, c4 = model.coefficients
+    prefix_sum = full * work.prefix + chunk * full * (full - 1) // 2
+    total = full * (c0 + c1 * chunk + c2 * chunk * chunk + c4) + c3 * chunk * prefix_sum
+    if tail:
+        total += model.predict_ms([PrefillWork(tail, work.prefix + full * chunk)])
+    if work.replay:
+        # Replay is charged once at the initial cached boundary.
+        total += model.predict_ms([PrefillWork(work.replay, work.prefix)])
+    return total

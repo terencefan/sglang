@@ -58,6 +58,8 @@ class SchedulerLoadInquirer:
         Callable[[CacheRequestHandle], tuple[int, int] | None] | None
     ) = None
 
+    prefill_cost_observer: Callable = lambda *args: None
+
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
 
@@ -85,6 +87,7 @@ class SchedulerLoadInquirer:
         waiting_queue_prefix_matched = self.waiting_queue_prefix_matched()
         cache_miss_rate = 1.0 - self.get_recent_cache_hit_rate()
         num_tokens = 0
+        self.prefill_cost_observer("begin")
         for req in self.get_waiting_queue():
             if waiting_queue_prefix_matched:
                 matched = req.num_matched_prefix_tokens
@@ -100,9 +103,13 @@ class SchedulerLoadInquirer:
                 # The historical hit rate already includes admitted storage hits.
                 uncached = int(req.seqlen * cache_miss_rate)
             num_tokens += uncached
+            self.prefill_cost_observer("request", req, uncached)
         cr = self.get_chunked_req()
         if cr is not None:
-            num_tokens += max(0, cr.seqlen - cr.prefix_len)
+            remaining = max(0, cr.seqlen - cr.prefix_len)
+            num_tokens += remaining
+            self.prefill_cost_observer("continuation", cr, remaining)
+        self.prefill_cost_observer("end")
         return num_tokens
 
     def get_loads(self) -> LoadSnapshot:

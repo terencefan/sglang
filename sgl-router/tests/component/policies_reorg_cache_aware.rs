@@ -85,6 +85,7 @@ fn report(
         &engine.url,
         0,
         LoadStat {
+            prefill_cost: None,
             num_running_reqs: 1,
             num_waiting_reqs: waiting,
             num_tokens: 10,
@@ -506,6 +507,7 @@ async fn balanced_by_running_requests_uses_basic_load_and_default_gap() {
                 &engine.url,
                 0,
                 LoadStat {
+                    prefill_cost: None,
                     num_running_reqs: running,
                     num_waiting_reqs: 0,
                     num_tokens: 10,

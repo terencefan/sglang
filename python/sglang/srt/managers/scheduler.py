@@ -2801,6 +2801,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
             get_shutting_down=lambda: self.gracefully_exit,
+            get_prefill_budget=lambda: getattr(getattr(self, "_prefill_cost_runtime", None), "budget", None),
             on_peer_shutdown=self.handle_peer_shutdown,
             **self._dp_drain_column_callbacks(),
         )
@@ -2916,6 +2917,15 @@ class Scheduler(
             get_stats=lambda: self.metrics_reporter.stats,
         )
 
+    def _observe_prefill_queue_cost(self, *args):
+        runtime = getattr(self, "_prefill_cost_runtime", None)
+        if runtime is not None:
+            runtime.queue_quote(*args)
+
+    def _prefill_cost_quote(self):
+        runtime = getattr(self, "_prefill_cost_runtime", None)
+        return runtime.quote() if runtime is not None else None
+
     def init_load_publisher(self) -> None:
         # Router-facing load reporting; rank gating and no-op fallback live
         # inside the component. Same interval as the DP-balancing writer so
@@ -2926,6 +2936,8 @@ class Scheduler(
             load_publish_endpoint=get_observability().load_publish_endpoint,
             publish_interval=get_observability().load_snapshot_publish_interval,
         )
+
+        self.load_publisher.prefill_cost_provider = self._prefill_cost_quote
 
     def init_load_inquirer(self) -> None:
         self.total_prefill_uncached_tokens = 0
@@ -2969,6 +2981,7 @@ class Scheduler(
                 self.total_prefill_uncached_tokens
             ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
+            prefill_cost_observer=lambda *args: Scheduler._observe_prefill_queue_cost(self, *args),
             get_decode_moment_totals=lambda: self.decode_moment_totals,
             get_waiting_storage_span=self.tree_cache.waiting_storage_span,
         )
@@ -4712,6 +4725,19 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
         max_prefill_tokens = self.max_prefill_tokens
+        # Experiment cap is applied after workspace/KV sizing. Fixed4096 and
+        # fixed8192 comparisons therefore keep identical memory capacity.
+        cost_runtime = getattr(self, "_prefill_cost_runtime", None)
+        if cost_runtime is not None:
+            cost_runtime.refresh_control()
+        fixed_rows = cost_runtime.fixed_rows if cost_runtime is not None else int(
+            os.environ.get("SGLANG_PREFILL_FIXED_CHUNK_ROWS", "0")
+        )
+        if fixed_rows not in (0, 4096, 8192):
+            raise ValueError("Prefill comparison cap must be 0, 4096 or 8192")
+        if fixed_rows:
+            chunked_prefill_size = min(chunked_prefill_size, fixed_rows)
+            max_prefill_tokens = min(max_prefill_tokens, fixed_rows)
         num_mixed_decode_tokens = running_bs if self.is_mixed_chunk else 0
         token_budget = self.policy.prefill_token_budget(
             page_size=self.page_size, align=self.truncation_align_size
@@ -4750,6 +4776,10 @@ class Scheduler(
             request_retirer=self.request_retirer,
             kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
         )
+
+        cost_runtime = getattr(self, "_prefill_cost_runtime", None)
+        if cost_runtime is not None:
+            adder.prefill_time_budget = cost_runtime.budget
 
         # The request between two chunks: in chunked_reqs, not in waiting_queue.
         resumed_req = self.chunked_req

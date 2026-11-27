@@ -1525,6 +1525,7 @@ mod tests {
         for (worker, ranks) in entries {
             for (dp_rank, &(waiting, uncached)) in (0..).zip(ranks.iter()) {
                 let load = LoadStat {
+                    prefill_cost: None,
                     num_running_reqs: 1,
                     num_waiting_reqs: waiting,
                     num_tokens: 10,

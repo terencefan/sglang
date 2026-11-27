@@ -28,6 +28,7 @@ fn engine() -> Arc<Worker> {
 
 fn report(running: u64, waiting: u64, kv_tokens: u64, pending: u64) -> LoadStat {
     LoadStat {
+        prefill_cost: None,
         num_running_reqs: running,
         num_waiting_reqs: waiting,
         num_tokens: kv_tokens,
@@ -131,6 +132,7 @@ async fn metrics_come_from_the_selection_snapshot_and_live_inflight_count() {
     drop(guard);
     // Basic reports carry request counts but no KV or pending-prefill tokens.
     let basic = LoadStat {
+        prefill_cost: None,
         native_cache: None,
         ..report(1, 2, 80, 5)
     };

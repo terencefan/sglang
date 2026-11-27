@@ -303,6 +303,7 @@ async fn chat_commits_the_admitted_prefill_backup() {
     .await;
     let now = Instant::now();
     let native_load = |total_prefill_uncached_tokens, total_prefill_busy_us| LoadStat {
+        prefill_cost: None,
         num_running_reqs: 1,
         num_waiting_reqs: 0,
         num_tokens: 100,
@@ -363,6 +364,7 @@ async fn capacity_exhaustion_does_not_return_503() {
             &worker.url,
             0,
             LoadStat {
+                prefill_cost: None,
                 num_running_reqs: 0,
                 num_waiting_reqs: 0,
                 num_tokens: 100,
@@ -446,6 +448,7 @@ async fn chat_records_cache_candidates_exhausted() {
         &fixture.workers[0].url,
         0,
         LoadStat {
+            prefill_cost: None,
             num_running_reqs: 1,
             num_waiting_reqs: 0,
             num_tokens: 100,

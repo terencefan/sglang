@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::policies::prefill_cost::PrefillCostSummary;
 use dashmap::{DashMap, DashSet};
 use serde::de::{self, Deserializer, IgnoredAny, SeqAccess, Visitor};
 use serde::Deserialize;
@@ -45,6 +46,7 @@ pub struct NativeCacheRankLoad {
 /// which deliberately excludes them from monitor-backed admission/guard.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadStat {
+    pub prefill_cost: Option<PrefillCostSummary>,
     /// Requests currently running on the engine.
     pub num_running_reqs: u64,
     /// Requests queued waiting to run.
@@ -74,6 +76,7 @@ pub struct EngineReportedWorkerLoad {
 /// One DP rank's fresh engine reading for load-aware rank selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RankLoad {
+    pub prefill_cost: Option<PrefillCostSummary>,
     pub rank: u32,
     /// KV tokens the rank has committed: in use, plus the prompt tokens of
     /// requests it holds but has not allocated for yet (the V4 feed's
@@ -290,8 +293,13 @@ impl<'de> Deserialize<'de> for LoadStat {
                         })
                     }
                 };
+                let prefill_cost = seq
+                    .next_element::<serde_json::Value>()?
+                    .and_then(|v| serde_json::from_value::<PrefillCostSummary>(v).ok())
+                    .filter(PrefillCostSummary::valid);
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
                 Ok(LoadStat {
+                    prefill_cost,
                     num_running_reqs,
                     num_waiting_reqs,
                     num_tokens,
@@ -629,6 +637,7 @@ impl EngineReportedLoadTable {
             let LoadEntry { load, at, .. } = entry.value();
             let fresh = now.saturating_duration_since(*at) <= self.freshness;
             let reading = RankLoad {
+                prefill_cost: load.prefill_cost,
                 rank: entry.key().1,
                 // Queued requests hold no KV yet, so in-use tokens alone make
                 // a rank with a deep queue look lightest.
@@ -697,8 +706,42 @@ impl EngineReportedLoadTable {
 mod tests {
     use super::*;
 
+    #[test]
+    fn optional_prefill_cost_quote_and_legacy_prefix() {
+        let quote = serde_json::json!({"schema":1,"model":123,"sequence":1,"boot":1,
+            "coefficients_ps":[0,1000000,0,0,0],"queue_us":10,"remaining_us":20});
+        let frame = serde_json::json!(["LoadStat", 7, 3, 1024, 8192, 2, 0, 0, 0, 0, 0, quote]);
+        let parsed = decode_load_stat(&rmp_serde::to_vec(&frame).unwrap()).unwrap();
+        assert_eq!(parsed.num_running_reqs, 7);
+        assert_eq!(parsed.prefill_cost.unwrap().finish_us(100, 2), Some(330));
+        let legacy = serde_json::json!(["LoadStat", 7, 3, 1024, 8192, 2, 0, 0, 0, 0, 0]);
+        assert!(decode_load_stat(&rmp_serde::to_vec(&legacy).unwrap())
+            .unwrap()
+            .prefill_cost
+            .is_none());
+        let unknown = serde_json::json!([
+            "LoadStat",
+            7,
+            3,
+            1024,
+            8192,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            "future-extension"
+        ]);
+        assert!(decode_load_stat(&rmp_serde::to_vec(&unknown).unwrap())
+            .unwrap()
+            .prefill_cost
+            .is_none());
+    }
+
     fn load(running: u64, waiting: u64) -> LoadStat {
         LoadStat {
+            prefill_cost: None,
             num_running_reqs: running,
             num_waiting_reqs: waiting,
             num_tokens: 0,
@@ -719,6 +762,7 @@ mod tests {
             total_prefill_busy_us: 5_000_000,
         };
         let mut load = LoadStat {
+            prefill_cost: None,
             num_running_reqs: 1,
             num_waiting_reqs: 10,
             num_tokens: 100_000,
@@ -868,6 +912,7 @@ mod tests {
             total_prefill_busy_us: 0,
         };
         let total = LoadStat {
+            prefill_cost: None,
             native_cache: Some(native),
             ..with_tokens(700)
         };

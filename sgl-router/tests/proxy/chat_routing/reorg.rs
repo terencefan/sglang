@@ -191,6 +191,7 @@ async fn bucket_config_limits_reject_before_dispatch_and_admit_after_load_drops(
             &worker.url,
             0,
             LoadStat {
+                prefill_cost: None,
                 num_running_reqs: running,
                 num_waiting_reqs: 0,
                 num_tokens: 0,

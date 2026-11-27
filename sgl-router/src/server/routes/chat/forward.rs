@@ -875,6 +875,50 @@ fn prompt_dp_rank(
                     source_queue_ms = o.source_queue_ms, predicted_finish_ms = o.predicted_finish_ms,
                     extra_tokens = o.extra_tokens, "prefill sustained queue overflow");
             }
+            // Price only the candidates already admitted by the existing
+            // cache/overflow guards. Unknown warm-prefix reloads fail closed.
+            let cost_mode = std::env::var("SGLANG_ROUTER_PREFILL_COST_MODE")
+                .unwrap_or_else(|_| "off".to_owned());
+            if cost_mode == "shadow" || cost_mode == "enforce" {
+                let quote = |rank: u32| -> Option<(u64, u64)> {
+                    if cached_tokens(rank) != 0 {
+                        return None;
+                    }
+                    let load = loads.iter().find(|l| l.rank == rank)?;
+                    let cost = load.prefill_cost?;
+                    let unseen = worker.dp_rank_dispatched_since(rank, load.at) as u64;
+                    Some((cost.model, cost.finish_us(tokens.ids.len() as u64, unseen)?))
+                };
+                if let Some((model, base)) = quote(selected) {
+                    let quotes: Option<Vec<_>> = loads
+                        .iter()
+                        .map(|l| {
+                            let (other_model, finish) = quote(l.rank)?;
+                            (other_model == model).then_some((l.rank, finish))
+                        })
+                        .collect();
+                    if let Some(quotes) = quotes {
+                        if let Some(&(candidate_rank, candidate)) =
+                            quotes.iter().min_by_key(|&&(r, c)| (c, r))
+                        {
+                            let better =
+                                crate::policies::prefill_cost::materially_better(candidate, base);
+                            tracing::debug!(
+                                from_rank = selected,
+                                candidate_rank,
+                                base_us = base,
+                                candidate_us = candidate,
+                                better,
+                                cost_mode,
+                                "prefill cost quote"
+                            );
+                            if cost_mode == "enforce" && better {
+                                selected = candidate_rank;
+                            }
+                        }
+                    }
+                }
+            }
             let selected_uncached = (tokens.ids.len() - cached_tokens(selected)) as u64;
             let extra = selected_uncached.saturating_sub(baseline_uncached);
             guard.book(

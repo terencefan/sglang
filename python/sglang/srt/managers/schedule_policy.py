@@ -8,6 +8,7 @@ from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_allocation_tokens,
 )
+from sglang.srt.managers.scheduler_components.prefill_budget import candidate_limit
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.managers.shortest_prefill_load import ShortestPrefillLoadScaling
 from sglang.srt.runtime_context import (
@@ -1786,6 +1787,14 @@ class PrefillAdder:
         if is_cp_sharded_padded():
             # Existing prefix padding can supply part of this chunk's KV rows.
             prefix_tokens = req.prefix_len
+        time_limit = candidate_limit(
+            self, prefix=req.prefix_len, replay=self._replay_len(req, req.prefix_len),
+            remaining=cand_extend_input_len, alignment=self.mamba_chunk_grid,
+        )
+        if time_limit is not None:
+            if time_limit <= 0:
+                return req
+            _rem_tokens = min(_rem_tokens, time_limit)
         _rem_tokens = self.memory_budget.fit_chunk(
             req,
             state_slots=self._state_slots_for_req(req),
@@ -1922,6 +1931,14 @@ class PrefillAdder:
             )
             if not can_admit:
                 return self._refused()
+        time_limit = candidate_limit(
+            self, prefix=req.prefix_len, replay=self._replay_len(req, req.prefix_len),
+            remaining=cand_extend_input_len, alignment=truncation_align_size,
+        )
+        if time_limit is not None:
+            if time_limit <= 0:
+                return AddReqResult.OTHER
+            chunk_limit = min(chunk_limit, time_limit) if chunk_limit is not None else time_limit
         fits = self.memory_budget.can_allocate_prefill(
             state_slots=self._state_slots_for_req(req),
             request_rows=self._request_rows_for_req(req),
@@ -2327,6 +2344,14 @@ class PrefillAdder:
             chunk_limit -= replay_len
             if chunk_limit <= 0:
                 return AddReqResult.OTHER
+        time_limit = candidate_limit(
+            self, prefix=prefix_len, replay=replay_len, remaining=extend_len,
+            alignment=truncation_align_size,
+        )
+        if time_limit is not None:
+            if time_limit <= 0:
+                return AddReqResult.OTHER
+            chunk_limit = min(chunk_limit, time_limit) if chunk_limit is not None else time_limit
         can_admit, chunk_tokens_limit = self._check_prefill_budget(
             req,
             extend_input_len=extend_len,

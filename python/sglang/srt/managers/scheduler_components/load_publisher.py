@@ -33,6 +33,7 @@ from itertools import count
 from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
+from msgspec.structs import astuple
 import zmq
 
 from sglang.srt.disaggregation.kv_events import (
@@ -241,24 +242,29 @@ class SchedulerLoadPublisher:
                 load.total_prefill_uncached_tokens,
                 load.total_prefill_busy_us,
             )
+            cost_provider = getattr(self, "prefill_cost_provider", None)
+            cost_quote = cost_provider() if cost_provider is not None else None
             if (
-                counts == self._last_counts
+                cost_quote is None
+                and counts == self._last_counts
                 and now - self._last_publish_ts < LOAD_PUBLISH_HEARTBEAT_S
             ):
                 return
-            payload = _encoder.encode(
-                LoadStat(
-                    num_running_reqs=counts[0],
-                    num_waiting_reqs=counts[1],
-                    num_tokens=counts[2],
-                    max_total_num_tokens=counts[3],
-                    attn_dp_rank=self._rank,
-                    num_waiting_uncached_tokens=counts[4],
-                    num_total_tokens=counts[5],
-                    max_running_requests=counts[6],
-                    total_prefill_uncached_tokens=counts[7],
-                    total_prefill_busy_us=counts[8],
-                )
+            stat = LoadStat(
+                num_running_reqs=counts[0],
+                num_waiting_reqs=counts[1],
+                num_tokens=counts[2],
+                max_total_num_tokens=counts[3],
+                attn_dp_rank=self._rank,
+                num_waiting_uncached_tokens=counts[4],
+                num_total_tokens=counts[5],
+                max_running_requests=counts[6],
+                total_prefill_uncached_tokens=counts[7],
+                total_prefill_busy_us=counts[8],
+            )
+            # Preserve the exact legacy bytes when no calibrated quote exists.
+            payload = _encoder.encode(stat) if cost_quote is None else _encoder.encode(
+                ["LoadStat", *astuple(stat), cost_quote]
             )
             seq = next(self._seq).to_bytes(8, "big")
             # PUB never blocks — it sheds at HWM. A silently dropped reading is

@@ -302,6 +302,20 @@ class TestLoadPublisherGating(CustomTestCase):
         self.assertFalse(pub.enable)
         pub.publish_load_stat(MagicMock(), force=True)  # still a no-op
 
+    def test_optional_cost_quote_preserves_legacy_prefix(self):
+        pub, _ = self._build()
+        quote = {"schema": 1, "model": 123, "sequence": 1, "boot": 1,
+                 "coefficients_ps": [0, 1000000, 0, 0, 0],
+                 "queue_us": 10, "remaining_us": 20}
+        pub.prefill_cost_provider = lambda: quote
+        pub.publish_load_stat(self._provider(running=7), force=True)
+        frames = pub._socket.send_multipart.call_args.args[0]
+        packet = msgspec.msgpack.decode(frames[2])
+        self.assertEqual(packet[0], "LoadStat")
+        self.assertEqual(packet[1], 7)
+        self.assertEqual(len(packet), 12)
+        self.assertEqual(packet[-1], quote)
+
     def test_close_is_idempotent_and_disables(self):
         pub, _ = self._build()
         socket = pub._socket

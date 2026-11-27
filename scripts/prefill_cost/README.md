@@ -1,6 +1,6 @@
 # H200 Prefill cost calibration
 
-Status: **shadow collection only; not a completed adaptive scheduler**.
+Status: **candidate implementation; GPU acceptance pending**.
 The base is the deployed Mooncake cleanup-race fix (29b12b1a92), rather than an
 older optimization worktree. New behavior is off by default. No deployment,
 GPU benchmark, throughput gain, DP agreement, or Router promotion is claimed.
@@ -49,28 +49,37 @@ DP sync wait is separate CPU metadata where available (zero is not evidence of
 no wait). Pending final samples may remain uncollected until another scheduler
 step; there is deliberately no shutdown CUDA synchronization.
 
-## Remaining implementation before enforce
+## Acceptance gates still open
 
-1. Isolate attention, MoE, H2D, scheduling, sync and PD handoff costs on H200;
-   add aggregate DP rows/padding, latency histograms and bounded diagnostic
-   sampling; measure shadow overhead <=1%.
-2. Introduce a whole-batch time-budget gate in PrefillAdder after cache match,
-   including continuation/ignore-EOS/replay paths, page and workspace bounds,
-   minimum progress and age protection.
-3. Carry readiness, signature and budget epoch through the existing MLP metadata
-   exchange. All ranks, including idle ranks, must agree before enforce; no
-   per-candidate collective. Preserve the old tensor protocol until its tests
-   and mixed-version deployment procedure are ready.
-4. Extend the existing load feed and Rust Router with optional signed cost
-   summaries, dispatch reconciliation, freshness fallback and 10% hysteresis;
-   retain the current cache-affinity/overflow candidate constraints.
-5. Paired fixed4096/fixed8192, engine-only, Router-only and combined replays;
-   cold/warm/mixed inputs, concurrency64/200, one-hour final run and drain.
-   Require >=5% cold throughput improvement, <=5% tail regressions, no new
-   errors or correctness failures. Keep memory, chunk cap and Decode fixed.
+- Actual H200 shadow overhead and forward-stream prediction accuracy, including
+  coverage of four context cohorts and DP aggregate shapes. Stream spans are
+  never presented as isolated kernel timing.
+- Model calibration and isolated A/B/A replay for fixed4096, fixed8192, engine
+  only, Router only and combined control. Keep KV/workspace capacity fixed.
+- Cold, warm and mixed replay; the first Router candidate deliberately falls
+  back for unknown warm-prefix reload costs. No L2 bandwidth is invented.
+- Quality and handoff checks, failure-free one-hour concurrency200 run plus
+  drain, GPU-memory/power/SM telemetry and a documented promote/reject decision.
+  Cold throughput gain must reach 5%; short/long P95 regressions must stay <=5%.
 
-An `enforce` environment value is rejected explicitly, rather than silently
-pretending to execute an unimplemented or unvalidated control policy.
+The candidate implements PrefillAdder gates for new requests, continuations
+and ignore-EOS, progress exceptions, DP model/time votes in the existing MLP
+exchange, and optional backward-compatible cold-cost load frames. The CPU
+probe asserts candidate import origins and runs with GPU visibility disabled;
+its Gloo exchange test checks the added metadata columns over 2–8 ranks.
+
+`enforce` is an experimental candidate mode requiring a same-signature model
+with a passed prediction gate, a positive `SGLANG_PREFILL_TIME_BUDGET_MS`, and
+DP-wide agreement through the existing MLP metadata exchange. Unready or
+incompatible ranks disable control. It has not been promoted to production.
+The new cold-only Router quote mode is independently controlled with
+`SGLANG_ROUTER_PREFILL_COST_MODE=off|shadow|enforce`; unknown cache reloads,
+missing quotes, mixed models and stale load retain the original route.
+
+For fixed-cap calibration, `SGLANG_PREFILL_FIXED_CHUNK_ROWS=4096|8192` limits
+scheduler admission after workspace and KV sizing. Keep the launch-time global
+chunk at 65536, so memory capacity remains identical between comparisons.
+No value (or zero) preserves the original scheduler cap.
 
 ## Local verification
 
@@ -81,3 +90,21 @@ python3 -m pytest -q \
 ```
 
 CPU event doubles verify nonblocking behavior only; they are not GPU acceptance.
+
+## In-process acceptance profiles
+
+`SGLANG_PREFILL_COST_CONTROL` may point to a task-owned local JSON file. It is
+polled at most four times per second; replacing it atomically with an increasing
+`generation` changes only mode, fixed_rows, target_ms and model_path. Models
+must match the execution signature and pass the holdout gate for enforce. DP
+control remains disabled until every rank votes for the same model. Invalid
+profiles disable control; they do not terminate serving. Record all eight
+`PREFILL_COST_CONTROL` receipts and finish warm-up before measuring a profile.
+
+Example shadow profile: `{"generation":1,"mode":"shadow","fixed_rows":8192}`.
+Example candidate: `{"generation":2,"mode":"enforce","target_ms":100,
+"model_path":"/task/model.json"}`. The target is illustrative: use measured
+fixed4096 P75/P90, never this example as an H200 calibration constant.
+This allows A/B/A acceptance without repeatedly loading the model or changing
+KV/workspace capacity. Initial installation still requires a controlled P
+restart; production ingress must be drained before that operation.

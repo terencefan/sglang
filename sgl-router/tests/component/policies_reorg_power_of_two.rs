@@ -27,6 +27,7 @@ fn engine(id: &str, stage: Stage, active: usize) -> Arc<Worker> {
 
 fn load(running: u64, waiting: u64, tokens: u64, capacity: u64, pending: u64) -> LoadStat {
     LoadStat {
+        prefill_cost: None,
         num_running_reqs: running,
         num_waiting_reqs: waiting,
         num_tokens: tokens,

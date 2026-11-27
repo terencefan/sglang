@@ -172,6 +172,7 @@ async fn rejection_and_load_switches_rebind_the_session() {
                     &engine.url,
                     0,
                     LoadStat {
+                        prefill_cost: None,
                         native_cache: Some(NativeCacheRankLoad {
                             num_waiting_uncached_tokens: pending,
                             num_total_tokens: 10,
@@ -228,6 +229,7 @@ async fn balanced_sessions_count_every_prompt_in_a_batch() {
                 &engine.url,
                 0,
                 LoadStat {
+                    prefill_cost: None,
                     native_cache: Some(NativeCacheRankLoad {
                         num_waiting_uncached_tokens: pending,
                         num_total_tokens: 10,
@@ -400,6 +402,7 @@ async fn admission_receives_fresh_load_on_assignment_and_reuse() {
             &engines[0].url,
             0,
             LoadStat {
+                prefill_cost: None,
                 num_waiting_reqs: waiting,
                 num_running_reqs: 1,
                 num_tokens: 10,

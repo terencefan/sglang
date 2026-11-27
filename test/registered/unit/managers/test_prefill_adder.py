@@ -268,6 +268,38 @@ class TestPrefillAdder(CustomTestCase):
             self.create_running_batch(), page_size=256, rem_chunk_tokens=chunk_tokens
         )
 
+    def _time_budget_adder(self, mode="enforce"):
+        from sglang.srt.managers.scheduler_components.prefill_budget import PrefillBudget as TimeBudget
+        from sglang.srt.managers.scheduler_components.prefill_cost_model import PrefillCostModel
+        adder = self.create_shortest_prefill_adder(chunk_tokens=8192)
+        budget = TimeBudget(mode, PrefillCostModel("test-h200", (0, 1, 0, 0, 0)), 1024)
+        budget.receive([budget.vote()] * 8)
+        adder.prefill_time_budget = budget
+        return adder
+
+    def test_time_budget_caps_new_request_after_cache_match(self):
+        adder = self._time_budget_adder()
+        req = self.create_shared_req("timed-new")
+        req.full_untruncated_fill_ids = list(range(16384))
+        adder.add_one_req(req, False, None)
+        self.assertIn(req, adder.can_run_list)
+        self.assertEqual(req.extend_len, 1024)
+
+    def test_time_budget_caps_continuation(self):
+        adder = self._time_budget_adder()
+        req = self.create_shared_req("timed-continuation")
+        req.full_untruncated_fill_ids = list(range(16384))
+        adder.add_chunked_req(req)
+        self.assertIn(req, adder.can_run_list)
+        self.assertEqual(req.extend_len, 1024)
+
+    def test_time_budget_shadow_preserves_fixed_chunk(self):
+        adder = self._time_budget_adder("shadow")
+        req = self.create_shared_req("shadow")
+        req.full_untruncated_fill_ids = list(range(16384))
+        adder.add_one_req(req, False, None)
+        self.assertEqual(req.extend_len, 8192)
+
     def test_capped_chunk_holds_its_rest_from_later_requests(self):
         """A request admitted beside a capped chunk may not take the KV the
         chunk's rest needs next pass; an uncapped chunk holds only itself."""

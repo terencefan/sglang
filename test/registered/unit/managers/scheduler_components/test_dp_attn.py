@@ -892,6 +892,8 @@ def _exchange_worker(rank, world, port, out_q):
                         round_idx == _EXCHANGE_ROUNDS - 1 and rank == sub - 1
                     ),
                     drain_state=(rank + round_idx) % 8,
+                    prefill_budget_model=12345,
+                    prefill_budget_us=1000 + rank,
                 )
                 local = info._get_local_tensor(device="cpu")
                 reference = torch.zeros(sub * local.numel(), dtype=torch.int64)
@@ -911,6 +913,8 @@ def _exchange_worker(rank, world, port, out_q):
                 )
                 with patch.object(dp_attn, "get_parallel", return_value=parallel):
                     info.all_gather(device="cpu", group=group)
+                assert info.tp0_info_cpu[:, 13].tolist() == [12345] * sub
+                assert info.tp0_info_cpu[:, 14].tolist() == list(range(1000, 1000 + sub))
                 out_q.put(
                     (
                         sub,

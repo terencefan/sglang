@@ -175,6 +175,8 @@ class MLPSyncBatchInfo:
     is_shutting_down: bool = False
     # This rank's listener drain state (see DPDrainColumn).
     drain_state: int = 0
+    prefill_budget_model: int = 0
+    prefill_budget_us: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -204,6 +206,8 @@ class MLPSyncBatchInfo:
                 self.attention_pairs,
                 int(self.is_shutting_down),
                 self.drain_state,
+                self.prefill_budget_model,
+                self.prefill_budget_us,
             ],
             device=device,
             dtype=dtype,
@@ -225,6 +229,8 @@ class MLPSyncBatchInfo:
                 0,  # attention_pairs
                 0,  # is_shutting_down
                 DRAIN_STATE_NO_LISTENER,  # drain_state
+                0,  # prefill_budget_model (unready/inactive)
+                0,  # prefill_budget_us
             ],
             device=device,
             dtype=dtype,
@@ -596,6 +602,7 @@ def prepare_mlp_sync_batch_raw(
     sync_wait_carry: Optional[DPSyncWaitCarry] = None,
     shutdown_vote: Optional[DPShutdownVote] = None,
     drain_column: Optional[DPDrainColumn] = None,
+    prefill_budget=None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -694,6 +701,7 @@ def prepare_mlp_sync_batch_raw(
         )
     skip_all_gather = should_skip_scheduler_all_gather(num_dp_ranks)
 
+    budget_vote = prefill_budget.vote() if prefill_budget is not None else (0, 0)
     mlp_sync_info = MLPSyncBatchInfo(
         num_dp_ranks=num_dp_ranks,
         tp_size=attn_tp_size,
@@ -713,6 +721,8 @@ def prepare_mlp_sync_batch_raw(
         attention_pairs=_local_attention_pairs(local_batch),
         is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
         drain_state=drain_column.local if drain_column is not None else 0,
+        prefill_budget_model=budget_vote[0],
+        prefill_budget_us=budget_vote[1],
     )
 
     if num_dp_ranks == 1:
@@ -725,6 +735,9 @@ def prepare_mlp_sync_batch_raw(
         )
 
     metadata_ready = mlp_sync_info.tp0_info_cpu is not None
+    if prefill_budget is not None:
+        votes = mlp_sync_info.tp0_info_cpu[:, 13:15].tolist() if metadata_ready else []
+        prefill_budget.receive(votes)
     if shutdown_vote is not None and metadata_ready:
         shutdown_vote.any = mlp_sync_info.any_shutting_down
     if drain_column is not None and metadata_ready:
@@ -813,6 +826,7 @@ class SchedulerDPAttnAdapter:
     # after each gather that produced metadata, which can be twice an
     # iteration (see DPDrainColumn).
     get_drain_state: Callable[[], int] = lambda: 0
+    get_prefill_budget: Callable = lambda: None
     on_drain_rows: Optional[Callable[[list[int]], None]] = None
     # Set once a gather carried this rank's own shutdown vote.
     shutdown_vote_sent: DPShutdownVoteSent = field(
@@ -863,6 +877,7 @@ class SchedulerDPAttnAdapter:
             sync_wait_carry=self.sync_wait_carry,
             shutdown_vote=shutdown_vote,
             drain_column=drain_column,
+            prefill_budget=self.get_prefill_budget(),
         )
         if drain_column.rows is not None and self.on_drain_rows is not None:
             self.on_drain_rows(drain_column.rows)

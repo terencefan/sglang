@@ -18,6 +18,7 @@ fn report(table: &EngineReportedLoadTable, rank: u32, running: u64, at: Instant)
         URL,
         rank,
         LoadStat {
+            prefill_cost: None,
             num_running_reqs: running,
             num_waiting_reqs: 2,
             num_tokens: 30,

@@ -441,6 +441,7 @@ mod tests {
         let at = Instant::now();
         let loads = [
             RankLoad {
+                prefill_cost: None,
                 prefill_tokens_per_second: None,
                 rank: 0,
                 num_tokens: 0,
@@ -449,6 +450,7 @@ mod tests {
                 at,
             },
             RankLoad {
+                prefill_cost: None,
                 prefill_tokens_per_second: None,
                 rank: 1,
                 num_tokens: 0,
@@ -489,6 +491,7 @@ mod tests {
         let at = Instant::now();
         let mut loads = [
             RankLoad {
+                prefill_cost: None,
                 prefill_tokens_per_second: None,
                 rank: 0,
                 num_tokens: 0,
@@ -497,6 +500,7 @@ mod tests {
                 at,
             },
             RankLoad {
+                prefill_cost: None,
                 prefill_tokens_per_second: None,
                 rank: 1,
                 num_tokens: 0,
@@ -524,6 +528,7 @@ mod tests {
         let cache = [(0, 390)]; // 99,840 cached; cold copy exceeds old per-request cap.
         let mut loads: Vec<_> = (0..3)
             .map(|rank| RankLoad {
+                prefill_cost: None,
                 rank,
                 num_tokens: 0,
                 num_reqs: if rank == 0 { 64 } else { 1 },
@@ -605,6 +610,7 @@ mod tests {
         let w = worker(2);
         let at = Instant::now() - Duration::from_millis(1);
         let reading = |rank, pending| RankLoad {
+            prefill_cost: None,
             prefill_tokens_per_second: None,
             rank,
             num_tokens: 0,
@@ -635,6 +641,7 @@ mod tests {
         let at = Instant::now();
         let mut loads = [
             RankLoad {
+                prefill_cost: None,
                 prefill_tokens_per_second: None,
                 rank: 0,
                 num_tokens: 0,
@@ -643,6 +650,7 @@ mod tests {
                 at,
             },
             RankLoad {
+                prefill_cost: None,
                 prefill_tokens_per_second: None,
                 rank: 1,
                 num_tokens: 0,
@@ -670,6 +678,7 @@ mod tests {
         let at = Instant::now();
         let mut loads = [
             RankLoad {
+                prefill_cost: None,
                 prefill_tokens_per_second: None,
                 rank: 0,
                 num_tokens: 0,
@@ -678,6 +687,7 @@ mod tests {
                 at,
             },
             RankLoad {
+                prefill_cost: None,
                 prefill_tokens_per_second: None,
                 rank: 1,
                 num_tokens: 0,
@@ -717,6 +727,7 @@ mod tests {
         let at = Instant::now();
         let loads = [
             RankLoad {
+                prefill_cost: None,
                 prefill_tokens_per_second: None,
                 rank: 0,
                 num_tokens: 0,
@@ -725,6 +736,7 @@ mod tests {
                 at,
             },
             RankLoad {
+                prefill_cost: None,
                 prefill_tokens_per_second: None,
                 rank: 1,
                 num_tokens: 0,
@@ -821,6 +833,7 @@ mod tests {
     fn expected_tokens_charge_every_request_at_the_median_request() {
         let w = worker(2);
         let reading = |rank, num_tokens, num_reqs, at| RankLoad {
+            prefill_cost: None,
             prefill_tokens_per_second: None,
             rank,
             num_tokens,
