@@ -284,8 +284,16 @@ async def run(a):
                 )
                 rows.append(row)
                 journal.write(json.dumps(row) + "\n")
-            if not row["success"]:
-                await asyncio.sleep(2)
+            if not row["success"] and not stopping:
+                try:
+                    await asyncio.sleep(2)
+                except asyncio.CancelledError:
+                    # Safety abort may arrive during retry backoff, after the
+                    # request was already journaled. Let the run write its
+                    # rejected summary and completion marker after draining.
+                    if not stopping:
+                        raise
+                    break
 
     async def report():
         while True:
