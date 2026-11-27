@@ -108,3 +108,15 @@ fixed4096 P75/P90, never this example as an H200 calibration constant.
 This allows A/B/A acceptance without repeatedly loading the model or changing
 KV/workspace capacity. Initial installation still requires a controlled P
 restart; production ingress must be drained before that operation.
+
+## Optional bounded Router CPU work
+
+`SGLANG_ROUTER_CPU_WORK_THREADS=4` opts into a dedicated pool for expensive
+request parsing, template render, tokenization and body rebuild. The default
+remains the existing inline blocking offload. This bounds active CPU scratch
+allocations without capping HTTP or engine concurrency. Tokio retains the I/O
+core handoff while callers wait for a pool slot. Nested CPU helpers execute on
+the same pool thread. This is a separate test-ingress safeguard: compare both
+Router arms with the same setting, verify real tokenizer parity and memory
+under concurrency200, and do not attribute its effect to Prefill kernel speed.
+No production memory or performance acceptance is implied by CPU unit tests.

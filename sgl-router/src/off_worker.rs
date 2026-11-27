@@ -12,16 +12,49 @@
 //! the I/O driver) to another thread before the blocking work starts, and it
 //! works on borrowed data, so callers keep their signatures.
 
+use std::sync::OnceLock;
+
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use tokio::runtime::{Handle, RuntimeFlavor};
+
+fn cpu_pool() -> Option<&'static ThreadPool> {
+    static POOL: OnceLock<Option<ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let value = std::env::var("SGLANG_ROUTER_CPU_WORK_THREADS").ok()?;
+        if value == "0" {
+            return None;
+        }
+        let threads = value.parse::<usize>().ok().filter(|n| (1..=64).contains(n));
+        let Some(threads) = threads else {
+            tracing::warn!("invalid SGLANG_ROUTER_CPU_WORK_THREADS; retaining legacy CPU offload");
+            return None;
+        };
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|n| format!("router-cpu-{n}"))
+            .build()
+            .expect("create bounded Router CPU pool");
+        tracing::info!(threads, "bounded Router CPU pool enabled");
+        Some(pool)
+    })
+    .as_ref()
+}
 
 /// Run `work` on the current thread, first moving this worker's async duties
 /// to another thread. On a current-thread runtime, outside any runtime, or on a
 /// blocking-pool thread, `work` runs inline: `block_in_place` would panic in
 /// the first case and has nothing to hand off in the others.
-pub(crate) fn run<R>(work: impl FnOnce() -> R) -> R {
+pub(crate) fn run<R: Send>(work: impl FnOnce() -> R + Send) -> R {
+    run_with_pool(cpu_pool(), work)
+}
+
+fn run_with_pool<R: Send>(pool: Option<&ThreadPool>, work: impl FnOnce() -> R + Send) -> R {
     match Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(work)
+            tokio::task::block_in_place(|| match pool {
+                Some(pool) => pool.install(work),
+                None => work(),
+            })
         }
         _ => work(),
     }
@@ -34,7 +67,7 @@ pub(crate) const MIN_OFFLOAD_BODY_BYTES: usize = 256 * 1024;
 /// [`run`] for work that grows with a `len`-byte body, such as JSON parse and
 /// rebuild. Smaller bodies run inline and skip the handoff. Render and
 /// tokenize go through [`run`] on their own, whatever the body size.
-pub(crate) fn run_for_body<R>(len: usize, work: impl FnOnce() -> R) -> R {
+pub(crate) fn run_for_body<R: Send>(len: usize, work: impl FnOnce() -> R + Send) -> R {
     if len >= MIN_OFFLOAD_BODY_BYTES {
         run(work)
     } else {
@@ -140,6 +173,42 @@ mod tests {
             ticked_after < took / 2,
             "timer task waited {ticked_after:?} while the work took {took:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn bounded_pool_limits_cpu_work_without_stalling_io() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let pool = Arc::new(ThreadPoolBuilder::new().num_threads(2).build().unwrap());
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&maximum);
+        let (took, ticked_after) = time_beside_a_timer(move || async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..16 {
+                let pool = Arc::clone(&pool);
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                tasks.spawn(async move {
+                    let borrowed = String::from("borrowed request");
+                    run_with_pool(Some(&pool), || {
+                        let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(n, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(50));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        borrowed.len()
+                    })
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                assert_eq!(result.unwrap(), 16);
+            }
+        })
+        .await;
+        assert_eq!(observed.load(Ordering::SeqCst), 2);
+        assert!(ticked_after < took / 2, "CPU queue stalled async I/O");
     }
 
     #[tokio::test(flavor = "current_thread")]
