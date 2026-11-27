@@ -267,6 +267,7 @@ from sglang.srt.managers.scheduler_components.dp_attn import (
     SchedulerDPAttnAdapter,
     should_skip_scheduler_all_gather,
 )
+from sglang.srt.managers.scheduler_components.prefill_cost_runtime import observe_prefill_forward
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
 )
@@ -5439,6 +5440,7 @@ class Scheduler(
         return forward_done
 
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
+    @observe_prefill_forward
     def run_batch(
         self,
         batch: ScheduleBatch,
