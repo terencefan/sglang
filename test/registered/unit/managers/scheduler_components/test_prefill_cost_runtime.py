@@ -275,10 +275,13 @@ class RuntimeTests(TestCase):
             samples.append(
                 {
                     "signature": "h200",
+                    "rank": i % 8,
+                    "boot": f"rank-{i % 8}-boot-a",
                     "hicache_pending": False,
                     "work": [{"rows": rows, "prefix": prefix}],
                     "gpu_stream_ms": 1 + 0.001 * rows + 0.000001 * rows * prefix,
                     "global_num_tokens": [rows] * 8,
+                    "cpu_launch_ns": (i + 1) * 10_000_000_000,
                 }
             )
         result = calibration.fit(samples, "h200")
@@ -287,6 +290,7 @@ class RuntimeTests(TestCase):
         self.assertEqual(result["dp_degree"], 8)
         self.assertEqual(len(result["coefficients"]), 7)
         self.assertLess(result["p95_error"], 0.05)
+        self.assertTrue(result["temporal_holdout_verified"])
         self.assertFalse(result["serving_gate"])
         with self.assertRaises(ValueError):
             calibration.fit(samples, "other-hardware")

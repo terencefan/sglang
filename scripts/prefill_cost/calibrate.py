@@ -31,6 +31,12 @@ def nnls(x, y):
 
 
 def features(work, global_num_tokens=None):
+    if any(
+        type(w.get(key, 0)) is not int or w.get(key, 0) < 0
+        for w in work
+        for key in ("rows", "prefix", "replay")
+    ):
+        raise ValueError("work must contain nonnegative integer rows/prefix/replay")
     q = [w["rows"] + w.get("replay", 0) for w in work]
     result = [
         1,
@@ -41,7 +47,7 @@ def features(work, global_num_tokens=None):
     ]
     if global_num_tokens is not None:
         if not global_num_tokens or any(
-            not isinstance(x, int) or x < 0 for x in global_num_tokens
+            type(x) is not int or x < 0 for x in global_num_tokens
         ):
             raise ValueError("invalid shared DP rows")
         result += [sum(global_num_tokens), max(global_num_tokens)]
@@ -54,7 +60,16 @@ def fit(samples, signature, *, shared=True):
     ]
     if len(samples) < 100:
         raise ValueError("at least 100 same-signature non-reload samples required")
-    if all("cpu_launch_ns" in s for s in samples):
+    temporal = all("cpu_launch_ns" in s for s in samples)
+    if shared and not temporal:
+        raise ValueError("shared model requires launch clocks for temporal holdout")
+    if temporal:
+        if any(
+            type(s["cpu_launch_ns"]) is not int
+            or not 0 < s["cpu_launch_ns"] <= np.iinfo(np.int64).max
+            for s in samples
+        ):
+            raise ValueError("invalid launch clock")
         samples.sort(key=lambda s: s["cpu_launch_ns"])
     degree = 1
     if shared:
@@ -67,6 +82,18 @@ def fit(samples, signature, *, shared=True):
         degree = len(shapes[0])
         if not 1 <= degree <= 64:
             raise ValueError("invalid DP degree")
+        boots = {}
+        for sample in samples:
+            rank, boot = sample.get("rank"), sample.get("boot")
+            if type(rank) is not int or not 0 <= rank < degree:
+                raise ValueError("invalid or missing DP sample rank")
+            if not isinstance(boot, str) or not boot:
+                raise ValueError("missing rank boot identity")
+            boots.setdefault(rank, set()).add(boot)
+        if any(len(values) != 1 for values in boots.values()):
+            raise ValueError("mixed rank boots require separate calibration")
+        if set(boots) != set(range(degree)):
+            raise ValueError("calibration requires all DP ranks")
     split = int(len(samples) * 0.7)
     x = np.asarray(
         [
@@ -78,7 +105,7 @@ def fit(samples, signature, *, shared=True):
     train = np.arange(len(samples)) < split
     test = ~train
     gap_ms = 0
-    if all("cpu_launch_ns" in s for s in samples):
+    if temporal:
         clock = np.asarray([s["cpu_launch_ns"] for s in samples], dtype=np.int64)
         gap_ms = max(1000, 2 * max(s["gpu_stream_ms"] for s in samples))
         boundary = clock[split]
@@ -86,6 +113,12 @@ def fit(samples, signature, *, shared=True):
         test = clock > boundary + gap_ms * 1000000
         if train.sum() < 50 or test.sum() < 20:
             raise ValueError("not enough timing-gap-separated holdout samples")
+    if shared and any(
+        {s["rank"] for s, included in zip(samples, mask) if included}
+        != set(range(degree))
+        for mask in (train, test)
+    ):
+        raise ValueError("both training and holdout must cover all DP ranks")
     y = np.asarray([s["gpu_stream_ms"] for s in samples], dtype=float)
     if not np.isfinite(x).all() or not np.isfinite(y).all() or (y <= 0).any():
         raise ValueError("invalid timing samples")
@@ -94,7 +127,10 @@ def fit(samples, signature, *, shared=True):
     coefficients /= scale
     err = np.abs(x[test] @ coefficients - y[test]) / y[test]
     # Fair baseline: least-squares ms/row on the identical training split.
-    rate = (x[train, 1] @ y[train]) / (x[train, 1] @ x[train, 1])
+    denominator = x[train, 1] @ x[train, 1]
+    if denominator <= 0:
+        raise ValueError("token/rate baseline requires positive training work")
+    rate = (x[train, 1] @ y[train]) / denominator
     old = np.abs(x[test, 1] * rate - y[test]) / y[test]
     p95, old95 = float(np.quantile(err, 0.95)), float(np.quantile(old, 0.95))
     return {
@@ -102,6 +138,7 @@ def fit(samples, signature, *, shared=True):
         "feature_contract": "shared-dp-v2" if shared else "local-v1",
         "dp_degree": degree,
         "holdout_gap_ms_each_side": gap_ms,
+        "temporal_holdout_verified": temporal,
         "signature": signature,
         "coefficients": coefficients.tolist(),
         "samples": len(samples),
@@ -110,7 +147,7 @@ def fit(samples, signature, *, shared=True):
         "p50_error": float(np.quantile(err, 0.5)),
         "p95_error": p95,
         "baseline_p95_error": old95,
-        "prediction_gate": p95 <= 0.2 and p95 <= 0.8 * old95,
+        "prediction_gate": temporal and p95 <= 0.2 and p95 <= 0.8 * old95,
         "serving_gate": False,
         "measurement": "scheduler_forward_stream_span",
     }

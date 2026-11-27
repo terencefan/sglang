@@ -142,5 +142,12 @@ features publishes no cost quote, retaining legacy routing.
 The sampler records the scheduler forward counter (including idle passes) for
 diagnostics. Rank records are correlated; the fitter sorts by the same-host
 launch clock and leaves a timing gap around chronological holdout boundaries.
+Shared-model fitting rejects missing/invalid launch clocks, mixed boots for a
+rank, and incomplete DP-rank coverage in either training or holdout. Without
+launch clocks, legacy fitting is diagnostic only and cannot pass the prediction
+gate. Collect from one verified host boot: monotonic clocks from different hosts
+or host reboots cannot be merged. These checks prevent leakage and missing-rank
+coverage; they do not establish cold/warm/mixed or concurrency coverage. The
+isolated replay protocol must still verify those regimes and the serving gates.
 The Router accepts both legacy schema1 and schema2 quotes; unknown contracts
 are ignored while preserving the native load prefix.
