@@ -227,6 +227,16 @@ fn expand_deepseek_references(messages: &mut Value, tools: &mut [Value]) -> Resu
                 .filter(|(_, tool)| tool["function"]["name"].as_str() == Some(name))
                 .map(|(index, _)| index)
                 .collect();
+            if matches.is_empty() {
+                tracing::warn!(
+                    tool_name = name,
+                    "historical tool reference has no current definition"
+                );
+                *part = json!({"type":"text","text":format!(
+                    "Previously referenced tool: {name}. Its definition is unavailable in this request."
+                )});
+                continue;
+            }
             if matches.len() != 1 {
                 return Err(format!(
                     "messages.{i}.content.{j}: tool reference '{name}' requires exactly one tool definition"
@@ -1199,9 +1209,14 @@ mod deepseek_reference_tests {
     }
 
     #[test]
-    fn rejects_unresolved_or_ambiguous_reference() {
+    fn preserves_historical_reference_and_rejects_ambiguous_definition() {
         let messages = json!([{"role":"tool","content":[{"type":"tool_reference","name":"Read"}]}]);
-        assert!(expand_deepseek_references(&mut messages.clone(), &mut []).is_err());
+        let mut historical = messages.clone();
+        expand_deepseek_references(&mut historical, &mut []).unwrap();
+        assert!(historical[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Read"));
         let tool = json!({"function":{"name":"Read"}});
         assert!(
             expand_deepseek_references(&mut messages.clone(), &mut [tool.clone(), tool]).is_err()
