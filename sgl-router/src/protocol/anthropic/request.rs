@@ -256,9 +256,9 @@ fn thinking_enabled(thinking: &Value) -> Result<bool, String> {
     let budget = field("budget_tokens");
     let display = field("display");
     if let Some(d) = display {
-        if !matches!(d.as_str(), Some("summarized" | "omitted")) {
+        if !matches!(d.as_str(), Some("summarized" | "omitted" | "updates")) {
             return Err(format!(
-                "thinking.display: expected summarized or omitted, got {d}"
+                "thinking.display: expected summarized, omitted or updates, got {d}"
             ));
         }
     }
@@ -1206,6 +1206,16 @@ mod deepseek_reference_tests {
             .chat
             .to_string()
             .contains("tool_reference"));
+    }
+
+    #[test]
+    fn accepts_cc_thinking_updates_without_disabling_reasoning() {
+        assert!(thinking_enabled(&json!({"type":"adaptive","display":"updates"})).unwrap());
+        assert!(thinking_enabled(
+            &json!({"type":"enabled","budget_tokens":2048,"display":"updates"})
+        )
+        .unwrap());
+        assert!(thinking_enabled(&json!({"type":"disabled","display":"updates"})).is_err());
     }
 
     #[test]
