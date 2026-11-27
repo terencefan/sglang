@@ -739,6 +739,20 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn shared_cost_extension_keeps_native_load_and_fails_closed_on_unknown_contract() {
+        let quote=serde_json::json!({"schema":2,"feature_contract":"shared-dp-v2",
+            "dp_degree":8,"model":123,"sequence":1,"boot":1,
+            "coefficients_ps":[0,0,0,0,0,1000000,1000000],"queue_us":10,"remaining_us":20});
+        let frame=serde_json::json!(["LoadStat",7,3,1024,8192,2,0,0,0,0,0,quote]);
+        let parsed=decode_load_stat(&rmp_serde::to_vec(&frame).unwrap()).unwrap();
+        assert_eq!(parsed.num_running_reqs,7);
+        assert_eq!(parsed.prefill_cost.unwrap().compute_us(100,0),900);
+        let mut invalid=frame;invalid[11]["feature_contract"]=serde_json::json!("unknown-contract");
+        let fallback=decode_load_stat(&rmp_serde::to_vec(&invalid).unwrap()).unwrap();
+        assert_eq!(fallback.num_running_reqs,7);assert!(fallback.prefill_cost.is_none());
+    }
+
     fn load(running: u64, waiting: u64) -> LoadStat {
         LoadStat {
             prefill_cost: None,

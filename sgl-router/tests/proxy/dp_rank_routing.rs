@@ -92,6 +92,7 @@ fn router_with_load(
     let inflight = RouterInflightLoadRegistry::new(Arc::new(SystemTimeClock), stale);
     let mut ctx =
         AppContext::with_router_inflight_load(cfg, tokenizers, proxy, registry, policies, inflight);
+    ctx.block_size_oracle = Arc::clone(&oracle);
     ctx.dp_rank_prefix_provider = Some(RadixTreePrefixProvider::new(tree, oracle));
     ctx.engine_reported_load = load;
     build_router(Arc::new(ctx))
@@ -576,7 +577,11 @@ async fn cold_cost_route_and_warm_prefix_fallback() {
         std::env::var("SGLANG_ROUTER_PREFILL_COST_MODE").as_deref(),
         Ok("enforce")
     );
-    for warm in [false, true] {
+    for (warm,shared,bad_degree,congested_target) in [
+        (false,false,false,false),(true,false,false,false),
+        (false,true,false,false),(true,true,false,false),
+        (false,true,true,false),(false,true,false,true),
+    ] {
         let (prefill, decode) = (
             MockWorker::start(vec![]).await,
             MockWorker::start(vec![]).await,
@@ -598,11 +603,15 @@ async fn cold_cost_route_and_warm_prefix_fallback() {
                 rank,
                 LoadStat {
                     prefill_cost: Some(PrefillCostSummary {
-                        schema: 1,
+                        schema: if shared {2}else{1},
                         model: 123,
                         boot: 1,
                         sequence: 1,
-                        coefficients_ps: [0, 1000000, 0, 0, 0],
+                        coefficients_ps: if shared {[0,0,0,0,0,1000000,0].into()}else{[0,1000000,0,0,0].into()},
+                        dp_degree: if bad_degree {3}else if shared{2}else{1},
+                        feature_contract:
+                            if shared {sgl_router::policies::prefill_cost::FeatureContract::Shared}
+                            else{sgl_router::policies::prefill_cost::FeatureContract::Local},
                         queue_us: if rank == 0 { 500000 } else { 0 },
                         remaining_us: 0,
                     }),
@@ -611,7 +620,7 @@ async fn cold_cost_route_and_warm_prefix_fallback() {
                     num_tokens: 0,
                     max_total_num_tokens: 1000000,
                     native_cache: Some(NativeCacheRankLoad {
-                        num_waiting_uncached_tokens: if rank == 0 { 0 } else { 1000 },
+                        num_waiting_uncached_tokens: if rank == 1 { 1000 } else { 0 },
                         num_total_tokens: 0,
                         max_running_requests: 640,
                         total_prefill_uncached_tokens: 0,
@@ -625,7 +634,42 @@ async fn cold_cost_route_and_warm_prefix_fallback() {
             (&prefill, WorkerMode::Prefill, 2),
             (&decode, WorkerMode::Decode, 2),
         ];
-        let app = router_with_load(cfg, &workers, tree, load);
+        let app = router_with_load(cfg, &workers, tree, Arc::clone(&load));
+        if congested_target {
+            // Keep both native reports fresh while seeding >10s of genuine
+            // pressure. A cheap model quote must not override this guard.
+            for step in 0..=11u64 {
+                for rank in 0..2 {
+                    load.set(&prefill.url,rank,LoadStat {
+                        prefill_cost:Some(PrefillCostSummary {
+                            schema:2,model:123,boot:1,sequence:step+2,
+                            coefficients_ps:[0,0,0,0,0,1000000,0].into(),dp_degree:2,
+                            feature_contract:sgl_router::policies::prefill_cost::FeatureContract::Shared,
+                            queue_us:if rank==0 {500000}else{0},remaining_us:0,
+                        }),
+                        num_running_reqs:if rank==1 {8}else{0},num_waiting_reqs:0,
+                        num_tokens:0,max_total_num_tokens:1000000,
+                        native_cache:Some(NativeCacheRankLoad {
+                            num_waiting_uncached_tokens:if rank==1 {1000000}else{0},
+                            num_total_tokens:0,max_running_requests:640,
+                            total_prefill_uncached_tokens:(step+1)*10000,
+                            total_prefill_busy_us:(step+1)*1000000,
+                        }),
+                    },Instant::now());
+                }
+                prefill.captured.lock().unwrap().headers.clear();
+                send(&app,&decode,&[]).await;
+                let started=Instant::now();
+                let rank=loop {
+                    if let Some(rank)=prefill.captured.lock().unwrap().headers.get(RANK).cloned(){break rank;}
+                    assert!(started.elapsed()<Duration::from_secs(2));
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                };
+                if step==11 {assert_eq!(rank,"0","pressure guard was bypassed");}
+                if step<11 {tokio::time::sleep(Duration::from_secs(1)).await;}
+            }
+            continue;
+        }
         send(&app, &decode, &[]).await;
         let start = Instant::now();
         let rank = loop {
@@ -638,6 +682,6 @@ async fn cold_cost_route_and_warm_prefix_fallback() {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
-        assert_eq!(rank, if warm { "0" } else { "1" }, "warm={warm}");
+        assert_eq!(rank, if warm || bad_degree || congested_target { "0" } else { "1" }, "warm={warm} shared={shared} degree={bad_degree} pressure={congested_target}");
     }
 }

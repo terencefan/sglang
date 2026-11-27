@@ -216,6 +216,57 @@ class RuntimeTests(TestCase):
         self.assertEqual(len(rt.pending), 0)
         self.assertEqual(sample["gpu_stream_ms"], 10.0)
 
+    def test_shared_runtime_uses_actual_peers_and_suppresses_unknown_idle_quote(self):
+        rt = runtime.PrefillCostRuntime.__new__(runtime.PrefillCostRuntime)
+        rt.signature = "h200"
+        rt.dp_degree = 8
+        rt.model = model.PrefillCostModel("h200", (1, 0.01, 0, 0, 0, 0.02, 0.03), 8)
+        rt.budget = budget.PrefillBudget("enforce", rt.model, 1000)
+        rt.queue_complete = True
+        rt.queue_us = 0
+        rt.quote_sequence = 1
+        batch = SimpleNamespace(
+            reqs=[SimpleNamespace(extend_len=317, prefix_len=98048)],
+            global_num_tokens=[317, 8192, 0, 0, 0, 0, 0, 0],
+        )
+        local = rt.model.predict_ms([model.PrefillWork(317, 98048)])
+        rt.update_activity(batch)
+        self.assertGreater(rt.predicted_ms, local)
+        quote = rt.quote()
+        self.assertEqual(quote["schema"], 2)
+        self.assertEqual(quote["dp_degree"], 8)
+        self.assertEqual(len(quote["coefficients_ps"]), 7)
+        rt.update_activity(
+            SimpleNamespace(reqs=[], global_num_tokens=batch.global_num_tokens)
+        )
+        self.assertIsNone(rt.quote())
+        rt.update_activity(SimpleNamespace(reqs=[], global_num_tokens=[0] * 8))
+        self.assertIsNotNone(rt.quote())
+        rt.update_activity(SimpleNamespace(reqs=batch.reqs, global_num_tokens=[]))
+        self.assertIsNone(rt.model)
+        self.assertEqual(rt.budget.vote(), (0, 0))
+
+    def test_shared_model_contract_is_explicit_and_degree_bound(self):
+        rt = runtime.PrefillCostRuntime.__new__(runtime.PrefillCostRuntime)
+        rt.signature = "h200"
+        rt.dp_degree = 8
+        artifact = {
+            "schema": 2,
+            "feature_contract": "shared-dp-v2",
+            "dp_degree": 8,
+            "signature": "h200",
+            "coefficients": [1, 0.01, 0, 0, 0, 0.02, 0.03],
+        }
+        self.assertTrue(rt.load_model(artifact).shared)
+        for changes in (
+            {"schema": 1},
+            {"feature_contract": "unknown"},
+            {"dp_degree": 4},
+            {"coefficients": [1, 0.01, 0, 0, 0]},
+        ):
+            with self.assertRaises(ValueError):
+                rt.load_model({**artifact, **changes})
+
     def test_chronological_fit_and_serving_gate(self):
         samples = []
         for i in range(200):
@@ -227,10 +278,14 @@ class RuntimeTests(TestCase):
                     "hicache_pending": False,
                     "work": [{"rows": rows, "prefix": prefix}],
                     "gpu_stream_ms": 1 + 0.001 * rows + 0.000001 * rows * prefix,
+                    "global_num_tokens": [rows] * 8,
                 }
             )
         result = calibration.fit(samples, "h200")
         self.assertEqual(result["train_samples"], 140)
+        self.assertEqual(result["schema"], 2)
+        self.assertEqual(result["dp_degree"], 8)
+        self.assertEqual(len(result["coefficients"]), 7)
         self.assertLess(result["p95_error"], 0.05)
         self.assertFalse(result["serving_gate"])
         with self.assertRaises(ValueError):

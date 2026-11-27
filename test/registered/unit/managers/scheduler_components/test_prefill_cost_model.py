@@ -95,6 +95,33 @@ class CostModelTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 m.PrefillCostModel("h200", (x, 0, 0, 0, 0))
 
+    def test_shared_rows_change_prediction_and_identity(self):
+        model = m.PrefillCostModel("h200", (1, 2, 3, 4, 5, 6, 7), 8)
+        work = [m.PrefillWork(10, 20, 2)]
+        small = model.predict_ms(work, global_num_tokens=[12] * 8)
+        large = model.predict_ms(work, global_num_tokens=[12, 8192, 0, 0, 0, 0, 0, 0])
+        self.assertGreater(large, small)
+        self.assertEqual(model.predict_ms(work), small)
+        self.assertNotEqual(
+            model.fingerprint,
+            m.PrefillCostModel("h200", model.coefficients, 4).fingerprint,
+        )
+        for shape in ([12], [-1] * 8, [1.5] * 8):
+            with self.assertRaises(ValueError):
+                model.predict_ms(work, global_num_tokens=shape)
+        self.assertGreater(
+            model.predict_ms([], global_num_tokens=[0, 8192, 0, 0, 0, 0, 0, 0]), 0
+        )
+
+    def test_shared_quote_matches_chunk_sum(self):
+        model = m.PrefillCostModel("h200", (1, 0.002, 1e-7, 1e-9, 0.1, 0.003, 0.004), 8)
+        work = m.PrefillWork(20000, 4096)
+        expected = sum(
+            model.predict_ms([m.PrefillWork(min(8192, 20000 - i), 4096 + i)])
+            for i in range(0, 20000, 8192)
+        )
+        self.assertAlmostEqual(m.remaining_cost_ms(model, work), expected)
+
     def test_quote(self):
         self.assertEqual(
             m.finish_quote_ms(

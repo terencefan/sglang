@@ -4,9 +4,12 @@ Times are milliseconds. Coefficients must be calibrated for the execution
 signature; these estimates never replace KV/workspace admission checks.
 """
 
+import hashlib
+import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cached_property
 
 
 @dataclass(frozen=True)
@@ -23,16 +26,39 @@ class PrefillWork:
 @dataclass(frozen=True)
 class PrefillCostModel:
     signature: str
-    coefficients: tuple[float, float, float, float, float]
+    coefficients: tuple[float, ...]
+    dp_degree: int = 1
 
     def __post_init__(self):
-        if not self.signature or len(self.coefficients) != 5:
-            raise ValueError("execution signature and five coefficients required")
+        if not self.signature or len(self.coefficients) not in (5, 7):
+            raise ValueError(
+                "execution signature and five or seven coefficients required"
+            )
+        if not isinstance(self.dp_degree, int) or not 1 <= self.dp_degree <= 64:
+            raise ValueError("invalid attention DP degree")
         if any(not math.isfinite(x) or x < 0 for x in self.coefficients):
             raise ValueError("cost coefficients must be finite and nonnegative")
 
-    def predict_ms(self, work: Sequence[PrefillWork]) -> float:
-        if not work:
+    @property
+    def shared(self):
+        return len(self.coefficients) == 7
+
+    @property
+    def feature_contract(self):
+        return "shared-dp-v2" if self.shared else "local-v1"
+
+    @cached_property
+    def fingerprint(self):
+        key = json.dumps(
+            [self.signature, self.coefficients, self.dp_degree, self.feature_contract],
+            sort_keys=True,
+        )
+        return int.from_bytes(hashlib.sha256(key.encode()).digest()[:7], "big") or 1
+
+    def predict_ms(
+        self, work: Sequence[PrefillWork], *, global_num_tokens=None
+    ) -> float:
+        if not work and (not self.shared or not global_num_tokens):
             return 0.0
         rows = [w.rows + w.replay for w in work]
         features = (
@@ -42,6 +68,18 @@ class PrefillCostModel:
             sum(q * w.prefix for q, w in zip(rows, work)),
             len(work),
         )
+        if self.shared:
+            if global_num_tokens is None:
+                # Admission/queue estimates assume saturated peers of the same
+                # size. This is a soft scheduling estimate, not a wall-time bound.
+                shared = [sum(rows)] * self.dp_degree
+            else:
+                shared = list(global_num_tokens)
+                if len(shared) != self.dp_degree or any(
+                    not isinstance(q, int) or q < 0 for q in shared
+                ):
+                    raise ValueError("invalid shared DP token shape")
+            features = (*features, sum(shared), max(shared))
         return sum(c * f for c, f in zip(self.coefficients, features))
 
     def chunk_rows(
@@ -110,7 +148,9 @@ def remaining_cost_ms(model, work, chunk=8192):
     if chunk <= 0:
         raise ValueError("positive quote chunk required")
     full, tail = divmod(work.rows, chunk)
-    c0, c1, c2, c3, c4 = model.coefficients
+    c0, c1, c2, c3, c4 = model.coefficients[:5]
+    if model.shared:
+        c1 += model.dp_degree * model.coefficients[5] + model.coefficients[6]
     prefix_sum = full * work.prefix + chunk * full * (full - 1) // 2
     total = full * (c0 + c1 * chunk + c2 * chunk * chunk + c4) + c3 * chunk * prefix_sum
     if tail:

@@ -880,14 +880,18 @@ fn prompt_dp_rank(
             let cost_mode = std::env::var("SGLANG_ROUTER_PREFILL_COST_MODE")
                 .unwrap_or_else(|_| "off".to_owned());
             if cost_mode == "shadow" || cost_mode == "enforce" {
-                let quote = |rank: u32| -> Option<(u64, u64)> {
+                let quote = |rank: u32| -> Option<((u64, u64, u64, crate::policies::prefill_cost::FeatureContract), u64)> {
                     if cached_tokens(rank) != 0 {
                         return None;
                     }
                     let load = loads.iter().find(|l| l.rank == rank)?;
                     let cost = load.prefill_cost?;
+                    if cost.schema == 2 && cost.dp_degree != u64::from(worker.dp_ranks()) {
+                        return None;
+                    }
                     let unseen = worker.dp_rank_dispatched_since(rank, load.at) as u64;
-                    Some((cost.model, cost.finish_us(tokens.ids.len() as u64, unseen)?))
+                    Some(((cost.model,cost.schema,cost.dp_degree,cost.feature_contract),
+                        cost.finish_us(tokens.ids.len() as u64, unseen)?))
                 };
                 if let Some((model, base)) = quote(selected) {
                     let quotes: Option<Vec<_>> = loads
@@ -899,7 +903,8 @@ fn prompt_dp_rank(
                         .collect();
                     if let Some(quotes) = quotes {
                         if let Some(&(candidate_rank, candidate)) =
-                            quotes.iter().min_by_key(|&&(r, c)| (c, r))
+                            quotes.iter().filter(|&&(r,_)| !congested.contains(&r))
+                                .min_by_key(|&&(r,c)| (c,r))
                         {
                             let better =
                                 crate::policies::prefill_cost::materially_better(candidate, base);

@@ -1,7 +1,5 @@
 """Pure CPU budget decisions shared by the scheduler and its DP metadata vote."""
 
-import hashlib
-import json
 import math
 from dataclasses import dataclass
 
@@ -40,11 +38,7 @@ class PrefillBudget:
     def vote(self):
         if self.mode != "enforce" or self.model is None or self.target_ms <= 0:
             return (0, 0)
-        key = json.dumps(
-            [self.model.signature, self.model.coefficients], sort_keys=True
-        )
-        digest = int.from_bytes(hashlib.sha256(key.encode()).digest()[:7], "big") or 1
-        return digest, max(1, int(self.target_ms * 1000))
+        return self.model.fingerprint, max(1, int(self.target_ms * 1000))
 
     def receive(self, votes):
         self.group_budget_us = consensus_budget(votes)

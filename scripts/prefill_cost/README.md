@@ -1,6 +1,6 @@
 # H200 Prefill cost calibration
 
-Status: **candidate implementation; GPU acceptance pending**.
+Status: **shared-DP v2 candidate; fresh GPU acceptance pending**.
 The base is the deployed Mooncake cleanup-race fix (29b12b1a92), rather than an
 older optimization worktree. New behavior is off by default. No deployment,
 GPU benchmark, throughput gain, DP agreement, or Router promotion is claimed.
@@ -120,3 +120,27 @@ the same pool thread. This is a separate test-ingress safeguard: compare both
 Router arms with the same setting, verify real tokenizer parity and memory
 under concurrency200, and do not attribute its effect to Prefill kernel speed.
 No production memory or performance acceptance is implied by CPU unit tests.
+
+## Shared-DP feature contract v2
+
+Schema2 uses seven nonnegative features in this order: constant, local total
+rows (including replay), local sum of per-request rows squared, local sum of
+rows times prefix, local request count, actual DP total rows, actual DP maximum
+rows. The artifact declares `feature_contract=shared-dp-v2` and the attention DP
+degree. DP serving rejects local-only or wrong-degree artifacts. Execution
+signatures still must match; old measurements cannot be relabeled as a newly
+deployed source signature.
+
+Forward prediction uses the actual `batch.global_num_tokens` already exchanged
+by MLP synchronization; no collective or GPU workspace is added. Admission and
+queued-request estimates cannot know the next peers' batches, so they assume
+saturated peers of the candidate's size. This is explicitly a soft estimate,
+not a guaranteed wall-time bound. GPU performance gates remain necessary. An
+idle rank participating in nonempty shared MoE work with unknown local phase
+features publishes no cost quote, retaining legacy routing.
+
+The sampler records the scheduler forward counter (including idle passes) for
+diagnostics. Rank records are correlated; the fitter sorts by the same-host
+launch clock and leaves a timing gap around chronological holdout boundaries.
+The Router accepts both legacy schema1 and schema2 quotes; unknown contracts
+are ignored while preserving the native load prefix.

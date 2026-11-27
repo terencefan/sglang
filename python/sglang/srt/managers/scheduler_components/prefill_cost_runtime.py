@@ -104,6 +104,8 @@ class PrefillCostRuntime:
         self.queue_complete = False
         self.quote_sequence = 0
         self.active_until_ns = 0
+        self.active_quote_known = True
+        self.predicted_ms = None
         if self.mode == "off":
             return
         self.signature = execution_signature(scheduler)
@@ -113,6 +115,13 @@ class PrefillCostRuntime:
         if parallel.pp_size != 1 or parallel.attn_cp_size != 1:
             raise ValueError("Prefill time budgets currently require PP1 and CP1")
         self.rank = parallel.attn_dp_rank
+        self.dp_degree = int(
+            getattr(
+                parallel,
+                "attn_dp_size",
+                getattr(getattr(scheduler, "server_args", None), "attn_dp_size", 1),
+            )
+        )
         self.interval = int(os.environ.get("SGLANG_PREFILL_COST_SAMPLE_INTERVAL", "32"))
         if self.interval < 1:
             raise ValueError("sample interval must be positive")
@@ -126,9 +135,7 @@ class PrefillCostRuntime:
                     "prediction_gate", False
                 ):
                     raise ValueError("model has not passed prediction holdout gate")
-                self.model = PrefillCostModel(
-                    self.signature, tuple(artifact["coefficients"])
-                )
+                self.model = self.load_model(artifact)
             except (OSError, KeyError, TypeError, ValueError) as exc:
                 logger.warning("Prefill cost model unavailable: %s", exc)
         self.budget.model = self.model
@@ -145,6 +152,55 @@ class PrefillCostRuntime:
         self.control_generation = 0
         self.refresh_control()
         logger.info("PREFILL_COST_SIGNATURE %s", self.signature)
+
+    def load_model(self, artifact):
+        degree = getattr(self, "dp_degree", 1)
+        coefficients = tuple(artifact["coefficients"])
+        if len(coefficients) == 7:
+            if (
+                artifact.get("schema") != 2
+                or artifact.get("feature_contract") != "shared-dp-v2"
+                or artifact.get("dp_degree") != degree
+            ):
+                raise ValueError("shared feature contract or DP degree mismatch")
+        elif degree != 1:
+            raise ValueError("attention DP requires a shared-feature cost model")
+        return PrefillCostModel(self.signature, coefficients, degree)
+
+    def update_activity(self, batch):
+        self.predicted_ms = None
+        self.active_quote_known = True
+        self.active_until_ns = 0
+        if self.model is None:
+            return
+        shared = list(getattr(batch, "global_num_tokens", None) or [])
+        if not batch.reqs:
+            # An idle local rank can still wait in shared MoE work. Without
+            # local phase features do not publish a fictitiously idle quote.
+            self.active_quote_known = not any(shared)
+            return
+        resets = getattr(batch, "encoder_swa_reset", None)
+        work = [
+            PrefillWork(
+                int(r.extend_len),
+                int(r.prefix_len),
+                min(int(r.prefix_len), 128) if resets is not None and resets[i] else 0,
+            )
+            for i, r in enumerate(batch.reqs)
+        ]
+        try:
+            self.predicted_ms = self.model.predict_ms(
+                work, global_num_tokens=shared if self.model.shared else None
+            )
+        except ValueError as exc:
+            logger.warning(
+                "Disabling Prefill cost model for missing DP context: %s", exc
+            )
+            self.model = self.budget.model = None
+            self.budget.group_budget_us = 0
+            self.active_quote_known = False
+            return
+        self.active_until_ns = time.monotonic_ns() + int(self.predicted_ms * 1000000)
 
     def refresh_control(self):
         # Optional local-file control is for isolated acceptance runs. It does
@@ -179,9 +235,7 @@ class PrefillCostRuntime:
                     raise ValueError("execution signature mismatch")
                 if mode == "enforce" and not artifact.get("prediction_gate", False):
                     raise ValueError("prediction holdout gate not passed")
-                model = PrefillCostModel(
-                    self.signature, tuple(artifact["coefficients"])
-                )
+                model = self.load_model(artifact)
             budget = PrefillBudget(mode, model, target)
             if mode == "enforce" and (model is None or target <= 0):
                 raise ValueError("enforce requires a calibrated model and time target")
@@ -228,15 +282,17 @@ class PrefillCostRuntime:
             self.quote_sequence += 1
 
     def quote(self):
-        if self.model is None or not self.queue_complete:
+        if (
+            self.model is None
+            or not self.queue_complete
+            or not getattr(self, "active_quote_known", True)
+        ):
             return None
-        key = json.dumps(
-            [self.model.signature, self.model.coefficients], sort_keys=True
-        )
         return {
-            "schema": 1,
-            "model": int.from_bytes(hashlib.sha256(key.encode()).digest()[:7], "big")
-            or 1,
+            "schema": 2 if self.model.shared else 1,
+            "feature_contract": self.model.feature_contract,
+            "dp_degree": self.model.dp_degree,
+            "model": self.model.fingerprint,
             "sequence": self.quote_sequence,
             "boot": self.boot_ns,
             "coefficients_ps": [round(c * 1000000000) for c in self.model.coefficients],
@@ -256,13 +312,7 @@ class PrefillCostRuntime:
     def begin(self, scheduler, batch):
         self.poll()
         self.step += 1
-        if self.model is not None:
-            work = [
-                PrefillWork(int(r.extend_len), int(r.prefix_len)) for r in batch.reqs
-            ]
-            self.active_until_ns = time.monotonic_ns() + int(
-                self.model.predict_ms(work) * 1000000
-            )
+        self.update_activity(batch)
         if self.step % self.interval or len(self.pending) == self.pending.maxlen:
             if len(self.pending) == self.pending.maxlen:
                 self.dropped += 1
@@ -297,7 +347,13 @@ class PrefillCostRuntime:
             "work": [
                 {"rows": w.rows, "prefix": w.prefix, "replay": w.replay} for w in work
             ],
-            "predicted_ms": self.model.predict_ms(work) if self.model else None,
+            "predicted_ms": self.predicted_ms,
+            "prediction_scope": "actual_shared_dp_rows",
+            "admission_scope": "saturated_peer_estimate",
+            "dp_degree": getattr(self, "dp_degree", 1),
+            "global_forward_iter": (
+                scheduler.forward_ct + 1 if hasattr(scheduler, "forward_ct") else None
+            ),
             "measurement": "scheduler_forward_stream_span",
             "hicache_pending": batch.hicache_consumer_index >= 0,
             "sync_wait_ms": (
@@ -340,10 +396,13 @@ def observe_prefill_forward(fn):
         if batch.forward_mode.is_extend_without_speculative() and batch.reqs:
             token = runtime.begin(scheduler, batch)
         else:
+            runtime.update_activity(batch)
             runtime.poll()
         result = fn(scheduler, batch, *args, **kwargs)
         if token is not None:
-            token[2]["cuda_graph_replay"] = bool(getattr(result, "can_run_cuda_graph", False))
+            token[2]["cuda_graph_replay"] = bool(
+                getattr(result, "can_run_cuda_graph", False)
+            )
         runtime.finish(token)
         return result
 

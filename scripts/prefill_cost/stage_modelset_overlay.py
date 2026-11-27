@@ -25,7 +25,11 @@ def main():
     p.add_argument("--previous-root", required=True)
     p.add_argument("--destination", required=True)
     p.add_argument("--generation", required=True, type=int)
+    p.add_argument("--boot-template")
+    p.add_argument("--expect-boot-sha256")
     args = p.parse_args()
+    if bool(args.boot_template) != bool(args.expect_boot_sha256):
+        p.error("boot template and expected hash must be specified together")
     repo = Path(__file__).resolve().parents[2]
     commit = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=repo, text=True
@@ -71,6 +75,8 @@ def main():
         "commit": commit,
         "base": BASE,
         "files": files,
+        "boot_template": args.boot_template,
+        "boot_sha256": args.expect_boot_sha256,
     }
     remote = """import base64,hashlib,json,os,shutil
 from pathlib import Path
@@ -82,11 +88,20 @@ assert previous['role']=='prefill' and previous['source_commit']==cfg['base']
 assert cfg['generation']>previous['generation']
 manifest=json.loads((old/'overlay-manifest.json').read_text())
 assert manifest['base_commit']==cfg['base']
+boot_bytes=None
+if cfg['boot_template']:
+ template=Path(cfg['boot_template'])
+ assert template.resolve().is_relative_to(old.parent.resolve()) and not template.is_symlink()
+ boot_bytes=template.read_bytes()
+ assert hashlib.sha256(boot_bytes).hexdigest()==cfg['boot_sha256']
+ compile(boot_bytes,str(template),'exec')
+
 old_paths={row['path'] for row in manifest['files']}
 assert not old_paths.intersection(row['path'] for row in cfg['files'])
 new.mkdir(mode=0o700)
 for name in ['launch.py','online_overlay.py','restore_jit_cache.py','boot.py','rdma_metrics.py','forward_batch_metrics.py','.profile-admin.key','prefill-tactics-8192.json']:
  shutil.copy2(old/name,new/name)
+if boot_bytes is not None:(new/'boot.py').write_bytes(boot_bytes)
 assert (new/'.profile-admin.key').stat().st_mode & 0o077 == 0
 for kind in ['baseline','candidate']:shutil.copytree(old/kind,new/kind)
 for row in cfg['files']:
