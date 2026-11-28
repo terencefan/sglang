@@ -74,7 +74,7 @@ pub struct AppContext {
     pub engine_reported_load: Arc<EngineReportedLoadTable>,
     pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
     pub radix_tree_prefix_provider: Option<RadixTreePrefixProvider>,
-    /// Local KV tree for `--dp-aware` rank selection, under any policy.
+    /// Local KV tree for cache-aware rank selection; absent in queue-only mode.
     pub dp_rank_prefix_provider: Option<RadixTreePrefixProvider>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
     /// Read-only handles `/metrics` pulls the KV storage-tier series from on

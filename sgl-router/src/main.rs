@@ -6,7 +6,7 @@ use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
     config::{
-        CachePrefixProvider, ChatRoutingKind, Cli, Config, DiscoveryBackend,
+        CachePrefixProvider, ChatRoutingKind, Cli, Config, DiscoveryBackend, DpRankPolicy,
         KvIndexerEndpointConfig, LogFormat, PolicyKind,
     },
     discovery::{spawn_discovery, ModelId},
@@ -296,10 +296,15 @@ fn prefix_index_config(indexer: &KvIndexerEndpointConfig) -> PrefixIndexConfig {
     }
 }
 
+fn cache_blind_routing(config: &Config) -> bool {
+    config.model.policy != PolicyKind::CacheAware
+        && config.model.dp_rank_policy == DpRankPolicy::PrefillQueueOnly
+}
+
 fn start_engine_state_monitor(config: &Config, use_external_indexer: bool) -> Arc<KvEventIndex> {
     let http = worker_client(Duration::from_secs(2), config.server.worker_auth.clone());
-    if use_external_indexer {
-        // External indexing still needs worker hash metadata and engine load, but no local KV tree.
+    if use_external_indexer || cache_blind_routing(config) {
+        // Queue-only routing needs native load feeds, but no KV event tree or peer bootstrap.
         return KvEventIndex::new_metadata_only_with_http_and_oracle(http, BlockSizeOracle::new());
     }
     // Peer discovery or explicit warm peers enable bootstrap; without either,
@@ -404,7 +409,8 @@ fn build_app_context(
     );
     // An external indexer leaves the local tree empty.
     app_context.dp_rank_prefix_provider = (config.model.dp_aware
-        && external_kv_indexer_client.is_none())
+        && external_kv_indexer_client.is_none()
+        && !cache_blind_routing(config))
     .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
     app_context.prefix_index = external_kv_indexer_client;
     app_context.radix_tree_prefix_provider = (config.model.policy == PolicyKind::CacheAware
@@ -687,6 +693,43 @@ mod tests {
         )
         .unwrap();
         assert!(ctx.dp_rank_prefix_provider.is_some());
+    }
+
+    #[tokio::test]
+    async fn queue_only_has_no_cache_index_or_prefix_provider() {
+        let config = Cli::try_parse_from([
+            "sgl-router",
+            "--model-id=tiny",
+            "--no-tokenizer",
+            "--worker-urls=http://127.0.0.1:1",
+            "--policy=power_of_two",
+            "--dp-aware",
+            "--dp-rank-policy=prefill_queue_only",
+        ])
+        .unwrap()
+        .into_config()
+        .unwrap();
+        let state = start_engine_state_monitor(&config, false);
+        assert!(state.snapshot_source().is_none());
+        let ctx = build_app_context(
+            &config,
+            Arc::new(TokenizerRegistry::load_from_config(&config).unwrap()),
+            Default::default(),
+            Default::default(),
+            start_local_inflight_tracker(&config).0,
+            &state,
+            None,
+        )
+        .unwrap();
+        assert!(ctx.dp_rank_prefix_provider.is_none());
+        assert!(ctx.radix_tree_prefix_provider.is_none());
+        assert!(ctx.prefix_index.is_none());
+        assert!(ctx.kv_index.is_none());
+        assert!(Arc::ptr_eq(
+            &ctx.engine_reported_load,
+            &state.engine_reported_load()
+        ));
+        state.shutdown().await;
     }
 
     #[tokio::test]

@@ -339,7 +339,7 @@ impl KvEventIndex {
 
     /// Discovers worker hash metadata only: seeds the shared [`BlockSizeOracle`]
     /// but neither subscribes to KV events nor maintains the local tree, because
-    /// an external Indexer is the routing signal.
+    /// an external Indexer is the routing signal or queue-only routing ignores cache.
     pub fn new_metadata_only_with_http_and_oracle(
         http: reqwest::Client,
         block_size_oracle: Arc<BlockSizeOracle>,

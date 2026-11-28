@@ -946,10 +946,12 @@ fn prompt_dp_rank(
             rank = Some(selected);
         }
     }
-    if let (Some(rank), Some(provider), Some(tokens)) =
-        (rank, &ctx.dp_rank_prefix_provider, &request.tokens)
-    {
-        provider.record_rank(&tokens.ids, &request.cache_namespace, &worker.url, rank);
+    if model.dp_rank_policy != DpRankPolicy::PrefillQueueOnly {
+        if let (Some(rank), Some(provider), Some(tokens)) =
+            (rank, &ctx.dp_rank_prefix_provider, &request.tokens)
+        {
+            provider.record_rank(&tokens.ids, &request.cache_namespace, &worker.url, rank);
+        }
     }
     rank
 }
