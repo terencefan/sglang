@@ -561,3 +561,77 @@ async fn embedding_like_endpoints_leave_the_rank_to_the_engine() {
         assert!(worker.captured_json().await.get("routed_dp_rank").is_none());
     }
 }
+
+/// Exercise the actual native /generate forwarding path: queue-first may
+/// override L1 affinity, and Decode must receive that exact Prefill rank.
+#[tokio::test]
+async fn queue_first_generate_preserves_pd_pairing_after_spilling_hot_rank() {
+    use sgl_router::state::load_monitor::engine_reported_load::NativeCacheRankLoad;
+    for (policy, expected) in [
+        (DpRankPolicy::PrefillWork, 0),
+        (DpRankPolicy::PrefillQueueFirst, 1),
+    ] {
+        let (prefill, decode) = (
+            MockWorker::start(vec![]).await,
+            MockWorker::start(vec![]).await,
+        );
+        let mut cfg = config();
+        cfg.model.dp_aware = true;
+        cfg.model.policy = PolicyKind::PowerOfTwo;
+        cfg.model.cache_aware = None;
+        cfg.model.dp_rank_policy = policy;
+        cfg.model.decode_dp_rank_policy = Some(DpRankPolicy::LeastInFlight);
+        let ids: Vec<u32> = (100..164).collect();
+        let tree = Arc::new(HashTree::new());
+        tree.insert(
+            &KvWorkerId::new(prefill.url.clone(), 0),
+            None,
+            &compute_block_hashes(&ids, 1),
+        );
+        let load = EngineReportedLoadTable::new();
+        for rank in 0..2 {
+            load.set(
+                &prefill.url,
+                rank,
+                LoadStat {
+                    num_running_reqs: 0,
+                    num_waiting_reqs: if rank == 0 { 8 } else { 0 },
+                    num_tokens: 0,
+                    max_total_num_tokens: 1_000_000,
+                    native_cache: Some(NativeCacheRankLoad {
+                        num_waiting_uncached_tokens: if rank == 0 { 100_000 } else { 0 },
+                        num_total_tokens: 0,
+                        max_running_requests: 128,
+                        total_prefill_uncached_tokens: 1,
+                        total_prefill_busy_us: 1,
+                    }),
+                },
+                Instant::now(),
+            );
+        }
+        let app = router_with_load(
+            cfg,
+            &[
+                (&prefill, WorkerMode::Prefill, 2),
+                (&decode, WorkerMode::Decode, 2),
+            ],
+            tree,
+            load,
+        );
+        let req = Request::post("/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"input_ids": ids, "sampling_params":{"max_new_tokens":1}, "stream":false})
+                    .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert!(response.status().is_success());
+        let p = prefill.captured_json().await;
+        let d = decode.captured_json().await;
+        assert_eq!(p["routed_dp_rank"], expected, "{policy:?}");
+        assert_eq!(d["disagg_prefill_dp_rank"], expected, "{policy:?}");
+        assert_eq!(p["bootstrap_room"].as_u64().unwrap() % 2, expected as u64);
+        assert!(d["routed_dp_rank"].as_u64().is_some_and(|r| r < 2));
+    }
+}
