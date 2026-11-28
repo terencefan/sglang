@@ -3269,10 +3269,24 @@ mod tests {
 
     #[test]
     fn queue_first_is_explicit_and_decode_can_remain_least_in_flight() {
+        let cache_blind = cfg_of("--policy power_of_two --dp-aware --dp-rank-policy prefill_queue_only --decode-dp-rank-policy least_in_flight").unwrap();
+        assert_eq!(
+            cache_blind.model.dp_rank_policy,
+            DpRankPolicy::PrefillQueueOnly
+        );
         let config = cfg_of("--policy cache_aware --dp-aware --dp-rank-policy prefill_queue_first --decode-dp-rank-policy least_in_flight").unwrap();
         assert_eq!(config.model.dp_rank_policy, DpRankPolicy::PrefillQueueFirst);
-        assert_eq!(config.model.decode_dp_rank_policy(), DpRankPolicy::LeastInFlight);
-        assert_eq!(cfg_of("--policy cache_aware --dp-aware").unwrap().model.dp_rank_policy, DpRankPolicy::LeastInFlight);
+        assert_eq!(
+            config.model.decode_dp_rank_policy(),
+            DpRankPolicy::LeastInFlight
+        );
+        assert_eq!(
+            cfg_of("--policy cache_aware --dp-aware")
+                .unwrap()
+                .model
+                .dp_rank_policy,
+            DpRankPolicy::LeastInFlight
+        );
         assert!(cfg_of("--policy cache_aware --dp-rank-policy prefill_queue_first").is_err());
     }
 

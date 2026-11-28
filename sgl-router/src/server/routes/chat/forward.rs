@@ -773,11 +773,15 @@ fn prompt_dp_rank(
         .into_iter()
         .flatten()
         .find_map(|name| nonempty_header(headers, name));
-    let placement = match (key, &ctx.dp_rank_prefix_provider, &request.tokens) {
-        (None, Some(provider), Some(tokens)) => {
-            provider.rank_depths(&tokens.ids, &request.cache_namespace, &worker.url)
+    let placement = if model.dp_rank_policy == DpRankPolicy::PrefillQueueOnly {
+        RankDepths::default()
+    } else {
+        match (key, &ctx.dp_rank_prefix_provider, &request.tokens) {
+            (None, Some(provider), Some(tokens)) => {
+                provider.rank_depths(&tokens.ids, &request.cache_namespace, &worker.url)
+            }
+            _ => RankDepths::default(),
         }
-        _ => RankDepths::default(),
     };
     let rank_tokens = rank_tokens(ctx, worker, model.dp_rank_policy);
     let mut rank = select_dp_rank(
@@ -788,7 +792,12 @@ fn prompt_dp_rank(
         &rank_tokens,
         model.dp_rank_policy,
     );
-    if key.is_none() && model.dp_rank_policy == DpRankPolicy::PrefillQueueFirst {
+    if key.is_none()
+        && matches!(
+            model.dp_rank_policy,
+            DpRankPolicy::PrefillQueueFirst | DpRankPolicy::PrefillQueueOnly
+        )
+    {
         if let (Some(fallback), Some(tokens), Some(loads)) = (
             rank,
             &request.tokens,
@@ -964,7 +973,10 @@ fn rank_tokens(ctx: &AppContext, worker: &Worker, policy: DpRankPolicy) -> Vec<(
 fn rank_guard(worker: &Worker, rank: u32, policy: DpRankPolicy) -> DpRankGuard {
     if matches!(
         policy,
-        DpRankPolicy::LeastTokens | DpRankPolicy::PrefillWork | DpRankPolicy::PrefillQueueFirst
+        DpRankPolicy::LeastTokens
+            | DpRankPolicy::PrefillWork
+            | DpRankPolicy::PrefillQueueFirst
+            | DpRankPolicy::PrefillQueueOnly
     ) {
         worker.dp_rank_timestamped_guard(rank)
     } else {

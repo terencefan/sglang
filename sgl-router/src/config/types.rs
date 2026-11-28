@@ -187,6 +187,10 @@ pub enum DpRankPolicy {
     /// Explicit session/sticky routing remains pinned. Opt-in only.
     #[value(name = "prefill_queue_first")]
     PrefillQueueFirst,
+    /// Experimental cache-blind DP selection: queue/load only, no prefix
+    /// lookup or cache-depth tie break. Pair with a cache-blind worker policy.
+    #[value(name = "prefill_queue_only")]
+    PrefillQueueOnly,
 }
 
 /// Role served by a static bucket.

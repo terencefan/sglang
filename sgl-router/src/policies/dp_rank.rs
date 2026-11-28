@@ -415,9 +415,16 @@ pub fn select_dp_rank(
         let hash = u64::from_be_bytes(digest[..8].try_into().unwrap());
         return Some((hash % u64::from(ranks)) as u32);
     }
+    let preferred = if policy == DpRankPolicy::PrefillQueueOnly {
+        None
+    } else {
+        preferred
+    };
     let cached: Vec<_> = prefix_depths
         .iter()
-        .filter(|&&(rank, depth)| rank < ranks && depth > 0)
+        .filter(|&&(rank, depth)| {
+            policy != DpRankPolicy::PrefillQueueOnly && rank < ranks && depth > 0
+        })
         .collect();
     let candidates: Vec<u32> = match cached.iter().map(|&&(_, depth)| depth).max() {
         Some(deepest) => cached

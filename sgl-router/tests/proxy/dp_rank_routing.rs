@@ -567,9 +567,12 @@ async fn embedding_like_endpoints_leave_the_rank_to_the_engine() {
 #[tokio::test]
 async fn queue_first_generate_preserves_pd_pairing_after_spilling_hot_rank() {
     use sgl_router::state::load_monitor::engine_reported_load::NativeCacheRankLoad;
-    for (policy, expected) in [
-        (DpRankPolicy::PrefillWork, 0),
-        (DpRankPolicy::PrefillQueueFirst, 1),
+    for (policy, pending, expected) in [
+        (DpRankPolicy::PrefillWork, 100_000, 0),
+        (DpRankPolicy::PrefillQueueFirst, 100_000, 1),
+        (DpRankPolicy::PrefillQueueOnly, 100_000, 1),
+        (DpRankPolicy::PrefillQueueFirst, 0, 0),
+        (DpRankPolicy::PrefillQueueOnly, 0, 1),
     ] {
         let (prefill, decode) = (
             MockWorker::start(vec![]).await,
@@ -599,7 +602,7 @@ async fn queue_first_generate_preserves_pd_pairing_after_spilling_hot_rank() {
                     num_tokens: 0,
                     max_total_num_tokens: 1_000_000,
                     native_cache: Some(NativeCacheRankLoad {
-                        num_waiting_uncached_tokens: if rank == 0 { 100_000 } else { 0 },
+                        num_waiting_uncached_tokens: if rank == 0 { pending } else { 0 },
                         num_total_tokens: 0,
                         max_running_requests: 128,
                         total_prefill_uncached_tokens: 1,
