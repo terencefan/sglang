@@ -86,7 +86,9 @@ pub fn prefill_queue_first_rank(
     {
         return fallback;
     }
-    let start = worker.next_dp_rank_turn() % ranks as usize;
+    // Replicas have independent counters but observe the same engine snapshot.
+    // A deterministic turn would synchronize their cold, equally loaded picks.
+    let start = rand::random::<usize>() % ranks as usize;
     (0..ranks)
         .map(|i| ((i as usize + start) % ranks as usize) as u32)
         .min_by_key(|&rank| {
