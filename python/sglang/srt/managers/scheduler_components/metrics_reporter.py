@@ -1445,6 +1445,16 @@ class SchedulerMetricsReporter:
         self.stats.num_queue_reqs = QueueCount.from_reqs(
             lists[ListKind.WAITING], priority_enabled
         )
+        if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+            for phase in ("prefetch", "staging"):
+                count = sum(
+                    bool(timer is not None and timer.running)
+                    for req in lists[ListKind.WAITING]
+                    for timer in [getattr(req.time_stats, f"_storage_{phase}_wait", None)]
+                )
+                self.metrics_collector.storage_waiting_reqs.labels(
+                    **self.metrics_collector.labels, phase=phase
+                ).set(count)
         self.stats.num_grammar_queue_reqs = len(lists[ListKind.GRAMMAR])
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(

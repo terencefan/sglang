@@ -365,3 +365,25 @@ class TestStorageAdmissionWait(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestStorageWaitMetrics(CustomTestCase):
+    def test_only_completed_blocked_episodes_observed(self):
+        for phase in ('prefetch', 'staging'):
+            stats = rts.SchedulerReqTimeStats(enable_metrics=True)
+            stats.metrics_collector = mock.Mock()
+            timer = mock.Mock(running=False)
+            timer.observe.return_value = 0.0
+            setattr(stats, f'_storage_{phase}_wait', timer)
+            setattr(stats, f'storage_{phase}_wait_s', 0.0)
+            observe = getattr(stats, f'observe_storage_{phase}_ready')
+            observe(True)
+            stats.metrics_collector.observe_per_stage_req_latency.assert_not_called()
+            timer.running = True
+            observe(False)
+            stats.metrics_collector.observe_per_stage_req_latency.assert_not_called()
+            timer.observe.return_value = 0.25
+            observe(True)
+            stats.metrics_collector.observe_per_stage_req_latency.assert_called_once_with(
+                f'storage_{phase}_wait', 0.25
+            )
+            self.assertEqual(getattr(stats, f'storage_{phase}_wait_s'), 0.25)

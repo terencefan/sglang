@@ -828,11 +828,25 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def observe_storage_prefetch_ready(self, ready: bool):
         """Accumulate first blocked poll to the subsequent ready poll, per episode."""
         if self._storage_prefetch_wait is not None:
-            self.storage_prefetch_wait_s += self._storage_prefetch_wait.observe(ready)
+            timer = self._storage_prefetch_wait
+            was_blocked = timer.running
+            elapsed = timer.observe(ready)
+            self.storage_prefetch_wait_s += elapsed
+            if ready and was_blocked and self.enable_metrics and self.metrics_collector is not None:
+                self.metrics_collector.observe_per_stage_req_latency(
+                    "storage_prefetch_wait", elapsed
+                )
 
     def observe_storage_staging_ready(self, ready: bool):
         if self._storage_staging_wait is not None:
-            self.storage_staging_wait_s += self._storage_staging_wait.observe(ready)
+            timer = self._storage_staging_wait
+            was_blocked = timer.running
+            elapsed = timer.observe(ready)
+            self.storage_staging_wait_s += elapsed
+            if ready and was_blocked and self.enable_metrics and self.metrics_collector is not None:
+                self.metrics_collector.observe_per_stage_req_latency(
+                    "storage_staging_wait", elapsed
+                )
 
     def set_wait_queue_entry_time(self, ts=None):
         ts = ts or time.perf_counter()

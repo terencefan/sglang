@@ -386,6 +386,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.storage_waiting_reqs = Gauge(
+            name="sglang:storage_waiting_reqs",
+            documentation="Queued requests with an outstanding poll-observed L3 wait; phases may overlap.",
+            labelnames=[*labels.keys(), "phase"],
+            multiprocess_mode="mostrecent",
+        )
         self.num_grammar_queue_reqs = Gauge(
             name="sglang:num_grammar_queue_reqs",
             documentation="The number of requests in the grammar waiting queue.",
