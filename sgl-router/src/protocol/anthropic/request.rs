@@ -27,6 +27,7 @@ const FORWARDED: &[&str] = &[
     "top_k",
     "chat_template_kwargs",
     "continue_final_message",
+    "fast",
 ];
 
 /// `count_only`: `count_tokens` shape, no `max_tokens` required.
@@ -143,6 +144,14 @@ pub fn to_chat(req: Value, count_only: bool, inline_system: bool) -> Result<Conv
         if let Value::Object(ctk) = ctk {
             ctk.entry("thinking").or_insert(Value::Bool(enabled));
             ctk.entry("enable_thinking").or_insert(Value::Bool(enabled));
+        }
+    }
+
+    // DeepSeek supports standard mode only. Preserve an explicit false all the
+    // way to the engine, and reject unsupported values rather than dropping them.
+    if let Some(fast) = req.get("fast").filter(|v| !v.is_null()) {
+        if fast != &Value::Bool(false) {
+            return Err("fast: only false (standard mode) is supported".into());
         }
     }
 
@@ -1231,5 +1240,24 @@ mod deepseek_reference_tests {
         assert!(
             expand_deepseek_references(&mut messages.clone(), &mut [tool.clone(), tool]).is_err()
         );
+    }
+    #[test]
+    fn explicit_effort_and_standard_mode_survive_conversion() {
+        let req = json!({
+            "model": "deepseek-flash-1017", "max_tokens": 98304,
+            "messages": [{"role":"user","content":"hello"}],
+            "output_config": {"effort":"max"}, "fast": false,
+            "chat_template_kwargs": {"clear_thinking": false, "reasoning_effort": "max"}
+        });
+        let converted = to_chat(req.clone(), false, false).unwrap().chat;
+        assert_eq!(converted["reasoning_effort"], "max");
+        assert_eq!(converted["fast"], false);
+        assert_eq!(converted["chat_template_kwargs"]["clear_thinking"], false);
+        assert_eq!(converted["max_tokens"], 98304);
+        for invalid in [json!(true), json!("false"), json!(0)] {
+            let mut req = req.clone();
+            req["fast"] = invalid;
+            assert!(to_chat(req, false, false).unwrap_err().contains("fast:"));
+        }
     }
 }
