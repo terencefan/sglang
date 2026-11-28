@@ -494,6 +494,139 @@ mod tests {
     }
 
     #[test]
+    fn queue_only_bootstrap_pressure_is_secondary_to_even_one_pending_token() {
+        let w = worker(2);
+        let at = Instant::now();
+        let mut loads = vec![
+            RankLoad {
+                rank: 0,
+                num_tokens: 0,
+                num_reqs: 20,
+                pending_prefill_tokens: Some(0),
+                prefill_tokens_per_second: None,
+                at,
+            },
+            RankLoad {
+                rank: 1,
+                num_tokens: 0,
+                num_reqs: 1,
+                pending_prefill_tokens: Some(1),
+                prefill_tokens_per_second: None,
+                at,
+            },
+        ];
+        // Twenty bootstrap waiters are visible in num_reqs, but lose to the
+        // primary pending-token score before request count is considered.
+        assert_eq!(prefill_queue_first_rank(&w, 0, &[], 8192, &loads), 0);
+        loads[0].pending_prefill_tokens = Some(20 * 8192);
+        assert_eq!(prefill_queue_first_rank(&w, 0, &[], 8192, &loads), 1);
+    }
+
+    #[test]
+    fn queue_only_bootstrap_native_refresh_retires_local_dispatch_reservation() {
+        let w = worker(2);
+        let at = Instant::now();
+        let mut loads = vec![
+            RankLoad {
+                rank: 0,
+                num_tokens: 0,
+                num_reqs: 20,
+                pending_prefill_tokens: Some(0),
+                prefill_tokens_per_second: None,
+                at,
+            },
+            RankLoad {
+                rank: 1,
+                num_tokens: 0,
+                num_reqs: 1,
+                pending_prefill_tokens: Some(4096),
+                prefill_tokens_per_second: None,
+                at,
+            },
+        ];
+        let _reservation = w.dp_rank_timestamped_guard(0);
+        assert_eq!(prefill_queue_first_rank(&w, 0, &[], 8192, &loads), 1);
+        // Once a new native report covers the dispatch timestamp, the Router
+        // trusts the zero-token report even though that request awaits bootstrap.
+        let refreshed = Instant::now();
+        for load in &mut loads {
+            load.at = refreshed;
+        }
+        loads[0].num_reqs += 1;
+        assert_eq!(prefill_queue_first_rank(&w, 0, &[], 8192, &loads), 0);
+    }
+
+    #[test]
+    #[ignore = "requires private native snapshot fixture; no production trace in the public fork"]
+    fn queue_only_bootstrap_private_trace_replay() {
+        use std::collections::BTreeSet;
+        let path = std::env::var("PREFILL_BOOTSTRAP_REPLAY_FIXTURE").unwrap();
+        let samples: Vec<Vec<serde_json::Value>> =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(!samples.is_empty());
+        let mut forced_bootstrap = 0usize;
+        let weights = [256u64, 1024, 8192];
+        let mut changed_sets = [0usize; 3];
+        for sample in &samples {
+            assert_eq!(sample.len(), 8);
+            let w = worker(8);
+            let at = Instant::now();
+            let loads: Vec<RankLoad> = sample
+                .iter()
+                .map(|v| RankLoad {
+                    rank: v["rank"].as_u64().unwrap() as u32,
+                    num_tokens: 0,
+                    num_reqs: v["reqs"].as_u64().unwrap(),
+                    pending_prefill_tokens: Some(v["pending"].as_u64().unwrap()),
+                    prefill_tokens_per_second: None,
+                    at,
+                })
+                .collect();
+            let minima = |values: &[RankLoad]| -> BTreeSet<u32> {
+                let score = |v: &RankLoad| (v.pending_prefill_tokens.unwrap(), v.num_reqs);
+                let best = values.iter().map(score).min().unwrap();
+                values
+                    .iter()
+                    .filter(|v| score(v) == best)
+                    .map(|v| v.rank)
+                    .collect()
+            };
+            let baseline = minima(&loads);
+            let actual = prefill_queue_first_rank(&w, 0, &[], 8192, &loads);
+            assert!(baseline.contains(&actual));
+            if baseline.iter().all(|rank| {
+                sample
+                    .iter()
+                    .find(|v| v["rank"].as_u64() == Some(u64::from(*rank)))
+                    .unwrap()["bootstrap"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            }) {
+                forced_bootstrap += 1;
+            }
+            for (i, weight) in weights.iter().enumerate() {
+                let mut alternative = loads.clone();
+                for value in &mut alternative {
+                    let boots = sample
+                        .iter()
+                        .find(|v| v["rank"].as_u64() == Some(u64::from(value.rank)))
+                        .unwrap()["bootstrap"]
+                        .as_u64()
+                        .unwrap();
+                    value.pending_prefill_tokens =
+                        Some(value.pending_prefill_tokens.unwrap() + boots * weight);
+                }
+                let proposed = minima(&alternative);
+                let actual = prefill_queue_first_rank(&w, 0, &[], 8192, &alternative);
+                assert!(proposed.contains(&actual));
+                changed_sets[i] += usize::from(proposed != baseline);
+            }
+        }
+        println!("bootstrap snapshot replay: samples={}, forced_bootstrap={}, weights={weights:?}, changed_best_sets={changed_sets:?}; no dispatch ledger, no GPU performance claim", samples.len(), forced_bootstrap);
+    }
+
+    #[test]
     fn queue_first_spills_despite_deep_local_cache() {
         let w = worker(2);
         let at = Instant::now();
