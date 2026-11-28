@@ -63,6 +63,55 @@ pub fn expected_rank_tokens(worker: &Worker, loads: &[RankLoad]) -> Vec<(u32, u6
         .collect()
 }
 
+/// Experimental P-only queue-first selection. The caller supplies fresh reports.
+/// A complete native snapshot is mandatory; otherwise retain the old choice.
+/// Dispatch stamps reserve full prompt work until the next report, preventing
+/// a burst from herding onto a rank whose idle reading has not caught up.
+/// L3 reuse is not assumed to be free: acceptance measures actual cache hits,
+/// cold throughput and TTFT. Cache depth only breaks equal-work ties.
+pub fn prefill_queue_first_rank(
+    worker: &Worker,
+    fallback: u32,
+    prefix_depths: &[(u32, usize)],
+    prompt_tokens: usize,
+    loads: &[RankLoad],
+) -> u32 {
+    let ranks = worker.dp_ranks();
+    if ranks <= 1
+        || fallback >= ranks
+        || prompt_tokens == 0
+        || loads.len() != ranks as usize
+        || (0..ranks).any(|r| loads.iter().filter(|l| l.rank == r).count() != 1)
+        || loads.iter().any(|l| l.pending_prefill_tokens.is_none())
+    {
+        return fallback;
+    }
+    let start = worker.next_dp_rank_turn() % ranks as usize;
+    (0..ranks)
+        .map(|i| ((i as usize + start) % ranks as usize) as u32)
+        .min_by_key(|&rank| {
+            let load = loads.iter().find(|l| l.rank == rank).unwrap();
+            let sent = worker.dp_rank_dispatched_since(rank, load.at) as u64;
+            let queued = load
+                .pending_prefill_tokens
+                .unwrap()
+                .saturating_add(sent.saturating_mul(prompt_tokens as u64));
+            let depth = prefix_depths
+                .iter()
+                .filter(|&&(r, _)| r == rank)
+                .map(|&(_, d)| d)
+                .max()
+                .unwrap_or(0);
+            (
+                queued,
+                std::cmp::Reverse(depth),
+                load.num_reqs.saturating_add(sent),
+                worker.dp_rank_inflight(rank),
+            )
+        })
+        .unwrap_or(fallback)
+}
+
 /// Allow a cached request to spill only when saved queued work exceeds its
 /// recomputation cost plus four cache pages of hysteresis. Cache depths include
 /// host-backed entries: a GPU miss alone must not be charged as full prefill.
@@ -433,6 +482,66 @@ mod tests {
             supports_inline_system: false,
         };
         Worker::with_cb_config(spec, None, profile)
+    }
+
+    #[test]
+    fn queue_first_spills_despite_deep_local_cache() {
+        let w = worker(2);
+        let at = Instant::now();
+        let mut loads = vec![
+            RankLoad {
+                rank: 0,
+                num_tokens: 0,
+                num_reqs: 8,
+                pending_prefill_tokens: Some(100_000),
+                prefill_tokens_per_second: None,
+                at,
+            },
+            RankLoad {
+                rank: 1,
+                num_tokens: 0,
+                num_reqs: 0,
+                pending_prefill_tokens: Some(0),
+                prefill_tokens_per_second: None,
+                at,
+            },
+        ];
+        assert_eq!(
+            prefill_queue_first_rank(&w, 0, &[(0, 390)], 100_000, &loads),
+            1
+        );
+        loads[0].pending_prefill_tokens = Some(0);
+        assert_eq!(
+            prefill_queue_first_rank(&w, 0, &[(0, 390)], 100_000, &loads),
+            0
+        );
+        let _sent = w.dp_rank_timestamped_guard(0);
+        assert_eq!(
+            prefill_queue_first_rank(&w, 0, &[(0, 390)], 100_000, &loads),
+            1
+        );
+    }
+
+    #[test]
+    fn queue_first_incomplete_or_legacy_loads_fail_closed() {
+        let w = worker(2);
+        let load = RankLoad {
+            rank: 0,
+            num_tokens: 0,
+            num_reqs: 8,
+            pending_prefill_tokens: Some(100_000),
+            prefill_tokens_per_second: None,
+            at: Instant::now(),
+        };
+        assert_eq!(prefill_queue_first_rank(&w, 0, &[], 8192, &[load]), 0);
+        let mut other = load;
+        other.rank = 1;
+        other.pending_prefill_tokens = None;
+        assert_eq!(
+            prefill_queue_first_rank(&w, 0, &[], 8192, &[load, other]),
+            0
+        );
+        assert_eq!(prefill_queue_first_rank(&w, 0, &[], 8192, &[load, load]), 0);
     }
 
     #[test]

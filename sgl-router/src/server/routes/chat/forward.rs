@@ -11,7 +11,7 @@ use crate::config::DpRankPolicy;
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::dp_rank::{
     budgeted_prefill_work_rank, expected_rank_tokens, legacy_prefill_work_rank,
-    prefill_overflow_rank, prefill_work_rank, select_dp_rank,
+    prefill_overflow_rank, prefill_queue_first_rank, prefill_work_rank, select_dp_rank,
 };
 use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
 use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
@@ -788,6 +788,25 @@ fn prompt_dp_rank(
         &rank_tokens,
         model.dp_rank_policy,
     );
+    if key.is_none() && model.dp_rank_policy == DpRankPolicy::PrefillQueueFirst {
+        if let (Some(fallback), Some(tokens), Some(loads)) = (
+            rank,
+            &request.tokens,
+            ctx.engine_reported_load
+                .fresh_rank_loads(&worker.url, Instant::now()),
+        ) {
+            let selected = prefill_queue_first_rank(
+                worker,
+                fallback,
+                &placement.depths,
+                tokens.ids.len(),
+                &loads,
+            );
+            tracing::debug!(worker = %worker.url, from_rank = fallback, to_rank = selected,
+                prompt_tokens = tokens.ids.len(), "experimental queue-first prefill rank");
+            rank = Some(selected);
+        }
+    }
     if key.is_none() && model.dp_rank_policy == DpRankPolicy::PrefillWork {
         if let (Some(cached_rank), Some(tokens), Some(block_size), Some(loads)) = (
             rank,
@@ -945,7 +964,7 @@ fn rank_tokens(ctx: &AppContext, worker: &Worker, policy: DpRankPolicy) -> Vec<(
 fn rank_guard(worker: &Worker, rank: u32, policy: DpRankPolicy) -> DpRankGuard {
     if matches!(
         policy,
-        DpRankPolicy::LeastTokens | DpRankPolicy::PrefillWork
+        DpRankPolicy::LeastTokens | DpRankPolicy::PrefillWork | DpRankPolicy::PrefillQueueFirst
     ) {
         worker.dp_rank_timestamped_guard(rank)
     } else {

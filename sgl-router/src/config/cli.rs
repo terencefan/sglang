@@ -3268,6 +3268,15 @@ mod tests {
     }
 
     #[test]
+    fn queue_first_is_explicit_and_decode_can_remain_least_in_flight() {
+        let config = cfg_of("--policy cache_aware --dp-aware --dp-rank-policy prefill_queue_first --decode-dp-rank-policy least_in_flight").unwrap();
+        assert_eq!(config.model.dp_rank_policy, DpRankPolicy::PrefillQueueFirst);
+        assert_eq!(config.model.decode_dp_rank_policy(), DpRankPolicy::LeastInFlight);
+        assert_eq!(cfg_of("--policy cache_aware --dp-aware").unwrap().model.dp_rank_policy, DpRankPolicy::LeastInFlight);
+        assert!(cfg_of("--policy cache_aware --dp-rank-policy prefill_queue_first").is_err());
+    }
+
+    #[test]
     fn dp_rank_policy_requires_dp_aware_and_accepts_least_tokens() {
         assert_eq!(
             cfg_of("--policy cache_aware --dp-aware --dp-rank-policy prefill_work --decode-dp-rank-policy least_in_flight")

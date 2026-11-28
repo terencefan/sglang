@@ -158,7 +158,7 @@ pub enum DecodePolicyKind {
     LegacyHostAffinity,
 }
 
-/// How `--dp-aware` picks a DP rank. Except for `prefill_work`,
+/// How `--dp-aware` picks a DP rank. Except for the prefill load policies,
 /// explicit routing keys and cached prefixes take priority over load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum DpRankPolicy {
@@ -182,6 +182,11 @@ pub enum DpRankPolicy {
     /// prefix-first selection. Explicit sticky/session keys remain pinned.
     #[value(name = "prefill_work")]
     PrefillWork,
+    /// Experimental shared-L3 policy: queued uncached work wins; local cache
+    /// depth breaks queue ties. Requires a complete fresh native rank report.
+    /// Explicit session/sticky routing remains pinned. Opt-in only.
+    #[value(name = "prefill_queue_first")]
+    PrefillQueueFirst,
 }
 
 /// Role served by a static bucket.
