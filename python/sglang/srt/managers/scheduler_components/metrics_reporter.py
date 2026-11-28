@@ -1445,7 +1445,7 @@ class SchedulerMetricsReporter:
         self.stats.num_queue_reqs = QueueCount.from_reqs(
             lists[ListKind.WAITING], priority_enabled
         )
-        if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+        if self.enable_metrics and self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             for phase in ("prefetch", "staging"):
                 count = sum(
                     bool(timer is not None and timer.running)
